@@ -2,277 +2,662 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>PitPat Treadmill Control (Web Bluetooth)</title>
-    <!-- MDL CSS & JS -->
-    <link rel="stylesheet" href="https://code.getmdl.io/1.3.0/material.blue-light_blue.min.css">
-    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
-    <script defer src="https://code.getmdl.io/1.3.0/material.min.js"></script>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PitPat Treadmill</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#0b0d10" media="(prefers-color-scheme: dark)">
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
     <style>
+        :root {
+            --bg: #ffffff;
+            --surface: #f6f7f9;
+            --surface-2: #ffffff;
+            --border: #e6e8ec;
+            --border-strong: #d4d7dd;
+            --text: #0f1115;
+            --text-muted: #6b7280;
+            --accent: #2563eb;
+            --accent-text: #ffffff;
+            --success: #16a34a;
+            --danger: #dc2626;
+            --warning: #b45309;
+            --shadow: 0 1px 2px rgba(15, 17, 21, 0.04), 0 1px 1px rgba(15, 17, 21, 0.02);
+            --radius: 14px;
+            --radius-sm: 10px;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #0b0d10;
+                --surface: #14171c;
+                --surface-2: #1a1f26;
+                --border: #232830;
+                --border-strong: #2d333d;
+                --text: #e7e9ee;
+                --text-muted: #9aa0aa;
+                --accent: #60a5fa;
+                --accent-text: #0b0d10;
+                --success: #4ade80;
+                --danger: #f87171;
+                --warning: #fbbf24;
+                --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+            }
+        }
+
+        * { box-sizing: border-box; }
         html, body {
-            height: 100%;
-            width: 100%;
-            box-sizing: border-box;
-        }
-        body {
-            font-family: Arial, sans-serif;
             margin: 0;
-            background: #f8f9fa;
-            min-height: 100vh;
-            width: 100vw;
-            overflow-x: hidden;
+            background: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter",
+                         system-ui, "Helvetica Neue", Arial, sans-serif;
+            font-feature-settings: "tnum" 1;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
         }
-        .center-container {
-            min-height: 100vh;
+        button { font-family: inherit; }
+
+        .app {
+            max-width: 560px;
+            margin: 0 auto;
+            padding: 24px 20px 80px;
+        }
+
+        .app-header {
             display: flex;
-            flex-direction: column;
             align-items: center;
-            justify-content: flex-start;
-            padding: 2em 0;
-            box-sizing: border-box;
-            width: 100vw;
-            max-width: 100vw;
+            justify-content: space-between;
+            margin-bottom: 24px;
         }
-        h1 {
-            margin-top: 0.5em;
-            margin-bottom: 0.5em;
-            font-size: 1.7em;
+        .app-header h1 {
+            margin: 0;
+            font-size: 22px;
+            font-weight: 600;
+            letter-spacing: -0.01em;
+        }
+
+        .tabs {
+            display: inline-flex;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            padding: 3px;
+            gap: 2px;
+        }
+        .tab {
+            border: 0;
+            background: transparent;
+            color: var(--text-muted);
+            padding: 7px 14px;
+            border-radius: 999px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.15s, color 0.15s;
+        }
+        .tab.is-active {
+            background: var(--surface-2);
+            color: var(--text);
+            box-shadow: var(--shadow);
+        }
+
+        .panel { display: none; }
+        .panel.is-active { display: block; }
+
+        .status-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 24px;
+            gap: 12px;
+        }
+
+        .chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 13px;
+            font-weight: 500;
+            padding: 5px 10px;
+            border-radius: 999px;
+            border: 1px solid var(--border);
+            background: var(--surface);
+            color: var(--text-muted);
+        }
+        .chip::before {
+            content: "";
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+        .chip-connected { color: var(--success); border-color: color-mix(in oklab, var(--success) 35%, var(--border)); }
+        .chip-paused    { color: var(--warning); border-color: color-mix(in oklab, var(--warning) 35%, var(--border)); }
+        .chip-connecting{ color: var(--warning); border-color: color-mix(in oklab, var(--warning) 35%, var(--border)); }
+        .chip-disconnected { color: var(--text-muted); }
+
+        .btn {
+            border: 1px solid var(--border-strong);
+            background: var(--surface-2);
+            color: var(--text);
+            padding: 9px 14px;
+            border-radius: 10px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.12s, transform 0.05s, opacity 0.12s, border-color 0.12s;
+        }
+        .btn:hover:not(:disabled) { border-color: var(--text-muted); }
+        .btn:active:not(:disabled) { transform: scale(0.98); }
+        .btn:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+        }
+        .btn-primary {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: var(--accent-text);
+        }
+        .btn-primary:hover:not(:disabled) { filter: brightness(1.05); border-color: var(--accent); }
+        .btn-go {
+            background: var(--success);
+            border-color: var(--success);
+            color: white;
+        }
+        .btn-go:hover:not(:disabled) { filter: brightness(1.05); border-color: var(--success); }
+        .btn-stop {
+            background: var(--danger);
+            border-color: var(--danger);
+            color: white;
+        }
+        .btn-stop:hover:not(:disabled) { filter: brightness(1.05); border-color: var(--danger); }
+        .btn-ghost {
+            background: transparent;
+            border-color: var(--border);
+        }
+
+        .hero {
             text-align: center;
-            line-height: 1.1;
+            padding: 28px 16px 24px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            margin-bottom: 12px;
+        }
+        .hero-value {
+            font-size: 56px;
+            font-weight: 600;
+            letter-spacing: -0.02em;
+            line-height: 1;
+        }
+        .hero-label {
+            color: var(--text-muted);
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            margin-top: 10px;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .stat {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 12px 14px;
+        }
+        .stat-label {
+            color: var(--text-muted);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .stat-value {
+            font-size: 20px;
+            font-weight: 600;
+            margin-top: 4px;
+            letter-spacing: -0.01em;
+        }
+
+        .settings {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-bottom: 16px;
+        }
+        .setting {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 10px 12px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+        }
+        .setting-label {
+            color: var(--text-muted);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .segmented {
+            display: inline-flex;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 2px;
+            gap: 2px;
+        }
+        .seg {
+            border: 0;
+            background: transparent;
+            color: var(--text-muted);
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.12s, color 0.12s;
+        }
+        .seg.is-active {
+            background: var(--surface-2);
+            color: var(--text);
+            box-shadow: var(--shadow);
+        }
+
+        .slider-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 14px 16px 16px;
+            margin-bottom: 16px;
+        }
+        .slider-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            margin-bottom: 10px;
+        }
+        .slider-label {
+            color: var(--text-muted);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .slider-value {
+            font-size: 16px;
             font-weight: 600;
         }
-        .dashboard {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 1em;
-            margin-bottom: 1em;
-            justify-content: center;
-            width: 100%;
-            max-width: 900px;
-            box-sizing: border-box;
+        #sliderUnit {
+            color: var(--text-muted);
+            font-weight: 500;
+            margin-left: 2px;
         }
-        .mdl-card {
-            min-width: 120px;
-            max-width: 260px;
-            flex: 1 1 calc(33.333% - 1em);
+        input[type="range"] {
+            width: 100%;
+            -webkit-appearance: none;
+            appearance: none;
+            background: transparent;
+            height: 28px;
+            cursor: pointer;
+        }
+        input[type="range"]::-webkit-slider-runnable-track {
+            height: 6px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 999px;
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 22px;
+            height: 22px;
+            margin-top: -9px;
+            border-radius: 50%;
+            background: var(--accent);
+            border: 3px solid var(--surface-2);
+            box-shadow: 0 1px 4px rgba(0,0,0,0.18);
+            cursor: pointer;
+        }
+        input[type="range"]::-moz-range-track {
+            height: 6px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 999px;
+        }
+        input[type="range"]::-moz-range-thumb {
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: var(--accent);
+            border: 3px solid var(--surface-2);
+            box-shadow: 0 1px 4px rgba(0,0,0,0.18);
+            cursor: pointer;
+        }
+        input[type="range"]:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .controls {
+            display: grid;
+            grid-template-columns: auto 1fr 1fr auto;
+            gap: 8px;
+        }
+        .controls .btn { padding: 12px 14px; font-weight: 600; }
+
+        /* History / Calendar */
+        .history-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 8px;
+            margin-bottom: 14px;
+        }
+        .calendar {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 14px;
+        }
+        .calendar-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 12px;
+        }
+        .cal-month {
+            font-size: 15px;
+            font-weight: 600;
+            letter-spacing: -0.01em;
+        }
+        .cal-nav {
+            border: 1px solid var(--border);
+            background: var(--surface-2);
+            color: var(--text);
+            width: 32px;
+            height: 32px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 18px;
+            line-height: 1;
+            padding: 0;
+        }
+        .cal-nav:hover { border-color: var(--text-muted); }
+        .cal-weekdays {
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            gap: 4px;
+            margin-bottom: 6px;
+        }
+        .cal-weekdays > div {
             text-align: center;
-            box-sizing: border-box;
-            padding: 0.35em 0.5em 0.35em 0.5em;
-            margin: 0;
-            min-height: 0;
-            height: auto;
+            font-size: 11px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            padding: 4px 0;
+        }
+        .cal-grid {
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            gap: 4px;
+        }
+        .cal-day {
+            background: var(--surface-2);
+            border: 1px solid transparent;
+            border-radius: 8px;
+            padding: 6px 6px 8px;
+            min-height: 64px;
             display: flex;
             flex-direction: column;
+            justify-content: space-between;
+            text-align: left;
+            cursor: pointer;
+            color: var(--text);
+            font: inherit;
+            transition: border-color 0.12s, background 0.12s;
+        }
+        .cal-day.is-outside {
+            opacity: 0.35;
+            cursor: default;
+        }
+        .cal-day.is-empty:not(.is-outside) {
+            cursor: default;
+        }
+        .cal-day:not(.is-empty):not(.is-outside):hover {
+            border-color: var(--border-strong);
+        }
+        .cal-day.is-today .cal-day-num {
+            background: var(--accent);
+            color: var(--accent-text);
+            border-radius: 999px;
+            padding: 0 7px;
+            min-width: 20px;
+            display: inline-flex;
             justify-content: center;
-            align-items: center;
         }
-        .mdl-card__title {
-            justify-content: center;
-            padding: 0.35em 0 0.2em 0;
-            min-height: unset;
-            text-align: center;
-            width: 100%;
+        .cal-day.is-selected {
+            border-color: var(--accent);
+            background: color-mix(in oklab, var(--accent) 10%, var(--surface-2));
         }
-        .mdl-card__supporting-text {
-            padding: 0.2em 0 0.35em 0;
-            text-align: center;
-            width: 100%;
+        .cal-day-num {
+            font-size: 12px;
+            font-weight: 600;
         }
-        .card-title { font-size: 1.05em; color: #888; }
-        .card-value { font-size: 1.5em; margin-top: 0.1em; color: #222; font-weight: 700; }
-        .controls {
+        .cal-day-totals {
             display: flex;
-            gap: 1em;
-            margin-bottom: 1em;
-            width: 100%;
-            max-width: 600px;
+            flex-direction: column;
+            gap: 1px;
+            font-size: 11px;
+            line-height: 1.2;
+        }
+        .cal-day-totals .dist { color: var(--text); font-weight: 600; }
+        .cal-day-totals .kcal { color: var(--text-muted); }
+
+        .day-detail {
+            margin-top: 14px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 12px 14px;
+        }
+        .day-detail-header {
+            font-size: 13px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 10px;
+        }
+        .session-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr auto;
+            gap: 8px;
+            align-items: center;
+            padding: 8px 0;
+            border-top: 1px solid var(--border);
+            font-size: 14px;
+        }
+        .session-row:first-of-type { border-top: 0; }
+        .session-row .label { color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+        .session-row .v { font-weight: 600; }
+        .icon-btn {
+            border: 1px solid var(--border);
+            background: var(--surface-2);
+            color: var(--text-muted);
+            width: 30px;
+            height: 30px;
+            border-radius: 8px;
+            cursor: pointer;
+            padding: 0;
+            font-size: 14px;
+            line-height: 1;
+        }
+        .icon-btn:hover { color: var(--danger); border-color: var(--danger); }
+
+        /* Overlays */
+        .overlay {
+            position: fixed;
+            inset: 0;
+            display: flex;
+            align-items: center;
             justify-content: center;
-            box-sizing: border-box;
+            background: rgba(255,255,255,0.7);
+            z-index: 1000;
+            transition: opacity 0.3s;
         }
-        .slider-group { margin: 1em 0; width: 100%; max-width: 400px; }
-        .slider-label { margin-bottom: 0.5em; display: block; }
-        #status { margin-top: 1em; text-align: center; }
-        .mdl-slider { width: 100%; max-width: 300px; }
-        .mdl-textfield { flex: 1; }
-        .btn-red {
-            background-color: #d32f2f !important;
-            color: #fff !important;
+        .overlay[hidden] { display: none; }
+        @media (prefers-color-scheme: dark) {
+            .overlay { background: rgba(11,13,16,0.75); }
         }
-        .btn-green {
-            background-color: #388e3c !important;
-            color: #fff !important;
+        .overlay-dark { background: rgba(11,13,16,0.85); z-index: 1100; }
+
+        .spinner {
+            width: 44px;
+            height: 44px;
+            border: 3px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.9s linear infinite;
         }
-        .btn-red:disabled, .btn-green:disabled {
-            opacity: 0.5 !important;
-            filter: grayscale(30%);
-            cursor: not-allowed !important;
-            box-shadow: none !important;
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .countdown-number {
+            color: #fff;
+            font-size: 6rem;
+            font-weight: 700;
+            transition: transform 0.3s, opacity 0.3s;
         }
-        .chip-connected {
-            background: #388e3c !important;
-            color: #fff !important;
+
+        /* Toast */
+        .toast {
+            position: fixed;
+            left: 50%;
+            bottom: 24px;
+            transform: translateX(-50%);
+            background: var(--text);
+            color: var(--bg);
+            padding: 10px 16px;
+            border-radius: 999px;
+            font-size: 13px;
+            font-weight: 500;
+            box-shadow: 0 6px 24px rgba(0,0,0,0.25);
+            z-index: 1200;
+            max-width: 90vw;
         }
-        .chip-connecting {
-            background: #fbc02d !important;
-            color: #222 !important;
-        }
-        .chip-disconnected {
-            background: #d32f2f !important;
-            color: #fff !important;
-        }
-        .chip-paused {
-            background: #fbc02d !important;
-            color: #222 !important;
-        }
-        @media (max-width: 900px) {
-            .dashboard { max-width: 100vw; }
-        }
-        @media (max-width: 800px) {
-            .center-container { padding: 0.5em 0; }
-            .dashboard {
-                gap: 0.7em;
-                max-width: 100vw;
-            }
-            .mdl-card {
-                min-width: 0;
-                max-width: 100%;
-                flex: 1 1 calc(50% - 0.7em);
-                padding: 0.25em 0.3em 0.25em 0.3em;
-                min-height: 0;
-                height: auto;
-            }
-            .controls { flex-direction: column; gap: 0.7em; max-width: 100%; }
-            .slider-group { max-width: 100%; }
-        }
-        @media (max-width: 500px) {
-            .center-container { padding: 0.5em 1em; }
-            h1 { font-size: 1.05em; margin-top: 0.3em; margin-bottom: 0.3em; }
-            .card-title { font-size: 1em; }
-            .card-value { font-size: 1.1em; }
-            .mdl-slider { max-width: 100%; }
-            .dashboard { gap: 0.4em; }
-            .mdl-card {
-                padding: 0.15em 0.15em 0.15em 0.15em;
-                min-height: 0;
-                height: auto;
-            }
-            .controls {
-                flex-wrap: wrap;
-                flex-direction: row;
-                gap: 0.4em;
-            }
-            .controls button {
-                flex: 1 1 45%;
-                min-width: 0;
-                max-width: 100%;
-                margin: 0;
-            }
-            .history-table-container {
-                width: 100vw;
-                overflow-x: auto;
-                -webkit-overflow-scrolling: touch;
-                margin-left: -1em;
-                margin-right: -1em;
-            }
-            .mdl-data-table th, .mdl-data-table td {
-                padding: 0.4em 0.3em;
-            }
+        .toast[hidden] { display: none; }
+
+        @media (max-width: 480px) {
+            .app { padding: 16px 14px 80px; }
+            .hero-value { font-size: 48px; }
+            .stats-grid { grid-template-columns: repeat(2, 1fr); }
+            .cal-day { min-height: 56px; padding: 4px 4px 6px; }
+            .cal-day-totals { font-size: 10px; }
         }
     </style>
 </head>
 <body>
-    <div class="mdl-layout mdl-js-layout mdl-layout--fixed-tabs">
-        <header class="mdl-layout__header mdl-layout__header--scroll" style="justify-content:center;display:flex;">
-            <div class="mdl-layout__tab-bar mdl-js-ripple-effect">
-                <a href="#controls-panel" class="mdl-layout__tab is-active">Controls</a>
-                <a href="#history-panel" class="mdl-layout__tab">History</a>
-            </div>
+    <div class="app">
+        <header class="app-header">
+            <h1>PitPat</h1>
+            <nav class="tabs">
+                <button class="tab is-active" data-tab="controls">Controls</button>
+                <button class="tab" data-tab="history">History</button>
+            </nav>
         </header>
-        <main class="mdl-layout__content">
-            <section class="mdl-layout__tab-panel is-active" id="controls-panel">
-                <div class="center-container">
-                    <div class="controls">
-                        <button id="connectBtn" class="mdl-button mdl-js-button mdl-button--raised mdl-js-ripple-effect mdl-button--primary">Connect</button>
+
+        <main>
+            <section id="controls-panel" class="panel is-active">
+                <div class="status-row">
+                    <span id="statusChip" class="chip chip-disconnected">Disconnected</span>
+                    <button id="connectBtn" class="btn btn-primary">Connect</button>
+                </div>
+
+                <div class="hero">
+                    <div class="hero-value" id="speed">—</div>
+                    <div class="hero-label">Speed</div>
+                </div>
+
+                <div class="stats-grid">
+                    <div class="stat">
+                        <div class="stat-label">Distance</div>
+                        <div class="stat-value" id="distance">—</div>
                     </div>
-                    <div class="dashboard">
-                        <div class="mdl-card mdl-shadow--2dp">
-                            <div class="mdl-card__title"><span class="card-title">Speed</span></div>
-                            <div class="mdl-card__supporting-text card-value" id="speed">-</div>
-                        </div>
-                        <div class="mdl-card mdl-shadow--2dp">
-                            <div class="mdl-card__title"><span class="card-title">Distance</span></div>
-                            <div class="mdl-card__supporting-text card-value" id="distance">-</div>
-                        </div>
-                        <div class="mdl-card mdl-shadow--2dp">
-                            <div class="mdl-card__title"><span class="card-title">Calories</span></div>
-                            <div class="mdl-card__supporting-text card-value" id="calories">-</div>
-                        </div>
-                        <div class="mdl-card mdl-shadow--2dp">
-                            <div class="mdl-card__title"><span class="card-title">Steps</span></div>
-                            <div class="mdl-card__supporting-text card-value" id="steps">-</div>
-                        </div>
-                        <div class="mdl-card mdl-shadow--2dp">
-                            <div class="mdl-card__title"><span class="card-title">Duration</span></div>
-                            <div class="mdl-card__supporting-text card-value" id="duration">-</div>
-                        </div>
-                        <div class="mdl-card mdl-shadow--2dp">
-                            <div class="mdl-card__title"><span class="card-title">Running State</span></div>
-                            <span id="statusChip" class="mdl-chip chip-disconnected" style="vertical-align: middle;"><span class="mdl-chip__text">Disconnected</span></span>
+                    <div class="stat">
+                        <div class="stat-label">Calories</div>
+                        <div class="stat-value" id="calories">—</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-label">Steps</div>
+                        <div class="stat-value" id="steps">—</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-label">Duration</div>
+                        <div class="stat-value" id="duration">—</div>
+                    </div>
+                </div>
+
+                <div class="settings">
+                    <div class="setting">
+                        <span class="setting-label">Units</span>
+                        <div class="segmented" id="unitToggle" role="group" aria-label="Units">
+                            <button class="seg is-active" data-value="kph" type="button">KPH</button>
+                            <button class="seg" data-value="mph" type="button">MPH</button>
                         </div>
                     </div>
-                    <div class="controls">
-                        <button id="startBtn" class="mdl-button mdl-js-button mdl-button--raised mdl-js-ripple-effect btn-green" disabled>Start</button>
-                        <button id="stopBtn" class="mdl-button mdl-js-button mdl-button--raised mdl-js-ripple-effect btn-red" disabled>Stop</button>
-                        <button id="speedDownBtn" class="mdl-button mdl-js-button mdl-button--raised mdl-js-ripple-effect" disabled>Speed Down</button>
-                        <button id="speedUpBtn" class="mdl-button mdl-js-button mdl-button--raised mdl-js-ripple-effect" disabled>Speed Up</button>
+                    <div class="setting">
+                        <span class="setting-label">Incline</span>
+                        <div class="segmented" id="inclineToggle" role="group" aria-label="Incline">
+                            <button class="seg is-active" data-value="0" type="button">0%</button>
+                            <button class="seg" data-value="3" type="button">3%</button>
+                        </div>
                     </div>
-                    <div class="slider-group">
-                        <label class="slider-label" for="speedSlider">Set Speed (kph): <span id="sliderValue">0</span></label>
-                        <input type="range" id="speedSlider" min="1" max="6" step="0.1" value="1" class="mdl-slider mdl-js-slider">
+                </div>
+
+                <div class="slider-card">
+                    <div class="slider-row">
+                        <span class="slider-label">Target speed</span>
+                        <span class="slider-value"><span id="sliderValue">1.0</span><span id="sliderUnit"> kph</span></span>
                     </div>
+                    <input type="range" id="speedSlider" min="1" max="6" step="0.1" value="1">
+                </div>
+
+                <div class="controls">
+                    <button id="speedDownBtn" class="btn" disabled aria-label="Speed down">−</button>
+                    <button id="startBtn" class="btn btn-go" disabled>Start</button>
+                    <button id="stopBtn" class="btn btn-stop" disabled>Stop</button>
+                    <button id="speedUpBtn" class="btn" disabled aria-label="Speed up">+</button>
                 </div>
             </section>
-            <section class="mdl-layout__tab-panel" id="history-panel">
-                <div class="center-container">
-                    <div style="display:flex;justify-content:center;gap:0.5em;margin-bottom:0.5em;width:100%;max-width:700px;">
-                        <button id="exportHistoryBtn" class="mdl-button mdl-js-button mdl-button--raised mdl-js-ripple-effect">Export</button>
-                        <button id="importHistoryBtn" class="mdl-button mdl-js-button mdl-button--raised mdl-js-ripple-effect">Import</button>
-                        <input type="file" id="importHistoryInput" accept="application/json" style="display:none;" />
-                    </div>
-                    <div class="history-table-container">
-                        <table class="mdl-data-table mdl-js-data-table mdl-shadow--2dp" >
-                            <thead>
-                                <tr>
-                                    <th>Date</th>
-                                    <th>Duration</th>
-                                    <th>Steps</th>
-                                    <th>Calories</th>
-                                    <th>Avg Speed</th>
-                                    <th>Action</th>
-                                </tr>
-                            </thead>
-                            <tbody id="historyTableBody">
-                                <!-- Sessions will be injected here -->
-                            </tbody>
-                        </table>
-                    </div>
+
+            <section id="history-panel" class="panel">
+                <div class="history-actions">
+                    <button id="exportHistoryBtn" class="btn btn-ghost">Export</button>
+                    <button id="importHistoryBtn" class="btn btn-ghost">Import</button>
+                    <input type="file" id="importHistoryInput" accept="application/json" hidden />
                 </div>
+                <div class="calendar">
+                    <div class="calendar-header">
+                        <button class="cal-nav" id="prevMonthBtn" aria-label="Previous month">‹</button>
+                        <div class="cal-month" id="calMonth">—</div>
+                        <button class="cal-nav" id="nextMonthBtn" aria-label="Next month">›</button>
+                    </div>
+                    <div class="cal-weekdays">
+                        <div>Mon</div><div>Tue</div><div>Wed</div><div>Thu</div><div>Fri</div><div>Sat</div><div>Sun</div>
+                    </div>
+                    <div class="cal-grid" id="calGrid"></div>
+                </div>
+                <div class="day-detail" id="dayDetail" hidden></div>
             </section>
         </main>
     </div>
-    <!-- Loading Overlay -->
-    <div id="loadingOverlay" style="display:none;position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(255,255,255,0.7);z-index:9999;align-items:center;justify-content:center;">
-        <div class="mdl-spinner mdl-js-spinner is-active" style="width:64px;height:64px;"></div>
+
+    <div id="loadingOverlay" class="overlay" hidden>
+        <div class="spinner"></div>
     </div>
-    <!-- Countdown Overlay -->
-    <div id="countdownOverlay" style="display:none;position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(33,33,33,0.85);z-index:10000;align-items:center;justify-content:center;opacity:1;transition:opacity 0.5s;">
-        <span id="countdownNumber" style="color:#fff;font-size:6em;font-weight:bold;transition:transform 0.3s, opacity 0.3s;">3</span>
+    <div id="countdownOverlay" class="overlay overlay-dark" hidden>
+        <span id="countdownNumber" class="countdown-number">3</span>
     </div>
-    <!-- Snackbar for toast messages -->
-    <div id="snackbar" class="mdl-js-snackbar mdl-snackbar">
-        <div class="mdl-snackbar__text"></div>
-        <button class="mdl-snackbar__action" type="button"></button>
-    </div>
+    <div id="toast" class="toast" hidden></div>
+
     <script src="https://cdn.jsdelivr.net/npm/date-fns@4.1.0/cdn.min.js"></script>
     <script src="treadmill.js"></script>
 </body>
