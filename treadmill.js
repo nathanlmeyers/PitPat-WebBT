@@ -84,10 +84,8 @@ function startOfThisMonth() {
     return new Date(d.getFullYear(), d.getMonth(), 1);
 }
 function dayKey(d) {
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-function dayKeyFromTs(ts) {
-    return dayKey(new Date(ts));
+    const date = d instanceof Date ? d : new Date(d);
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 }
 function formatDuration(seconds) {
     seconds = Math.max(0, Math.floor(Number(seconds) || 0));
@@ -192,26 +190,22 @@ function applyUnitToSlider() {
     sliderValue.textContent = v.toFixed(1);
 }
 
-function setUnit(newUnit, { sendPacket = true } = {}) {
+function setUnit(newUnit) {
     if (newUnit !== 'kph' && newUnit !== 'mph') return;
     if (newUnit === unitMode) return;
     // Convert curTargetSpeed so the physical pace stays the same.
-    const oldUnit = unitMode;
     const currentVal = curTargetSpeed / 1000;
-    const newVal = oldUnit === 'kph' ? currentVal / KM_PER_MI : currentVal * KM_PER_MI;
+    const newVal = unitMode === 'kph' ? currentVal / KM_PER_MI : currentVal * KM_PER_MI;
     const newMin = newUnit === 'kph' ? 1.0 : 0.6;
     const newMax = newUnit === 'kph' ? 6.0 : 3.7;
-    const clamped = Math.min(newMax, Math.max(newMin, newVal));
-    curTargetSpeed = Math.round(clamped * 1000);
+    curTargetSpeed = Math.round(Math.min(newMax, Math.max(newMin, newVal)) * 1000);
     unitMode = newUnit;
     localStorage.setItem(PREF_UNIT, unitMode);
     updateSegmentedActive(unitToggle, unitMode);
     applyUnitToSlider();
     renderCalendar();
     if (selectedDayKey) renderDayDetail(selectedDayKey);
-    if (sendPacket && connected) {
-        send_data(makePacket('set_speed', curTargetSpeed));
-    }
+    if (connected) send_data(makePacket('set_speed', curTargetSpeed));
 }
 
 function setIncline(newIncline) {
@@ -276,7 +270,6 @@ async function connectBluetooth() {
 function disconnectBluetooth() {
     if (device && device.gatt.connected) device.gatt.disconnect();
     loadingOverlay.hidden = true;
-    setStatus('disconnected');
 }
 
 function onDisconnected() {
@@ -339,7 +332,6 @@ function handleNotification(event) {
         sessionActive = true;
         sessionStartData = {
             date: Date.now(),
-            startSteps: steps, startCalories: calories, startDistance: distance,
             steps, calories, distance,
             duration: raw.duration,
             speedSum: current_speed, speedCount: 1,
@@ -434,7 +426,7 @@ function aggregateByDay(sessions) {
     const map = new Map();
     for (const s of sessions) {
         if (!s || typeof s.date !== 'number') continue;
-        const key = dayKeyFromTs(s.date);
+        const key = dayKey(s.date);
         let agg = map.get(key);
         if (!agg) {
             agg = { distance: 0, calories: 0, sessions: [] };
@@ -503,7 +495,7 @@ function renderCalendar() {
                 selectedDayKey = (selectedDayKey === key) ? null : key;
                 renderCalendar();
                 if (selectedDayKey) renderDayDetail(selectedDayKey);
-                else { dayDetail.hidden = true; dayDetail.innerHTML = ''; }
+                else clearDayDetail();
             });
         }
         calGrid.appendChild(cell);
@@ -511,38 +503,53 @@ function renderCalendar() {
 }
 
 function renderDayDetail(key) {
-    const sessions = loadSessions().filter(s => s && typeof s.date === 'number' && dayKeyFromTs(s.date) === key);
+    const sessions = loadSessions().filter(s => s && typeof s.date === 'number' && dayKey(s.date) === key);
+    dayDetail.replaceChildren();
     if (sessions.length === 0) {
         dayDetail.hidden = true;
-        dayDetail.innerHTML = '';
         return;
     }
     sessions.sort((a, b) => b.date - a.date);
     const unit = unitOfDistance();
-    const header = `<div class="day-detail-header">${dateFns.format(new Date(sessions[0].date), 'EEEE, MMM d')} — ${sessions.length} session${sessions.length > 1 ? 's' : ''}</div>`;
-    const rows = sessions.map(s => {
+
+    const header = document.createElement('div');
+    header.className = 'day-detail-header';
+    header.textContent = `${dateFns.format(new Date(sessions[0].date), 'EEEE, MMM d')} — ${sessions.length} session${sessions.length > 1 ? 's' : ''}`;
+    dayDetail.appendChild(header);
+
+    for (const s of sessions) {
         const sUnit = s.distanceUnit || (s.speedUnit === 'mph' ? 'mi' : 'km');
         const dist = convertDistance(Number(s.distance) || 0, sUnit, unit).toFixed(2);
-        let kcal = s.calories;
-        if (typeof kcal === 'string') kcal = parseFloat(kcal) || 0;
+        const kcal = Math.round(Number(s.calories) || 0);
         const time = dateFns.format(new Date(s.date), 'h:mm a');
-        return `
-            <div class="session-row">
-                <div><div class="label">Time</div><div class="v">${time}</div></div>
-                <div><div class="label">Distance</div><div class="v">${dist} ${unit}</div></div>
-                <div><div class="label">Calories</div><div class="v">${Math.round(kcal)} kcal</div></div>
-                <button class="icon-btn" title="Delete" data-del="${s.date}">×</button>
-            </div>
-        `;
-    }).join('');
-    dayDetail.innerHTML = header + rows;
+
+        const row = document.createElement('div');
+        row.className = 'session-row';
+        row.appendChild(makeField('Time', time));
+        row.appendChild(makeField('Distance', `${dist} ${unit}`));
+        row.appendChild(makeField('Calories', `${kcal} kcal`));
+        const del = document.createElement('button');
+        del.className = 'icon-btn';
+        del.title = 'Delete';
+        del.textContent = '×';
+        del.addEventListener('click', () => deleteSessionByDate(s.date));
+        row.appendChild(del);
+        dayDetail.appendChild(row);
+    }
     dayDetail.hidden = false;
-    dayDetail.querySelectorAll('[data-del]').forEach(btn => {
-        btn.addEventListener('click', () => {
-            const ts = Number(btn.getAttribute('data-del'));
-            deleteSessionByDate(ts);
-        });
-    });
+}
+
+function makeField(label, value) {
+    const wrap = document.createElement('div');
+    const l = document.createElement('div');
+    l.className = 'label';
+    l.textContent = label;
+    const v = document.createElement('div');
+    v.className = 'v';
+    v.textContent = value;
+    wrap.appendChild(l);
+    wrap.appendChild(v);
+    return wrap;
 }
 
 // --- Event wiring ---
@@ -635,19 +642,21 @@ tabs.forEach(t => t.addEventListener('click', () => {
     if (t.dataset.tab === 'history') renderCalendar();
 }));
 
+function clearDayDetail() {
+    selectedDayKey = null;
+    dayDetail.hidden = true;
+    dayDetail.replaceChildren();
+}
+
 // Calendar nav
 prevMonthBtn.addEventListener('click', () => {
     calViewDate = dateFns.addMonths(calViewDate, -1);
-    selectedDayKey = null;
-    dayDetail.hidden = true;
-    dayDetail.innerHTML = '';
+    clearDayDetail();
     renderCalendar();
 });
 nextMonthBtn.addEventListener('click', () => {
     calViewDate = dateFns.addMonths(calViewDate, 1);
-    selectedDayKey = null;
-    dayDetail.hidden = true;
-    dayDetail.innerHTML = '';
+    clearDayDetail();
     renderCalendar();
 });
 
