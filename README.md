@@ -18,3 +18,7 @@ A web-based dashboard to control and monitor a PitPat treadmill via Bluetooth. F
 ## Live Demo
 
 [https://nathanlmeyers.github.io/PitPat-WebBT/](https://nathanlmeyers.github.io/PitPat-WebBT/)
+
+## Install as a desktop app (macOS / Windows / Linux)
+
+In Chrome (or Edge / Brave / Arc), open the live demo and click the **install** icon in the address bar — or open the ⋮ menu and pick **Cast, save, and share → Install page as app…**. You'll get a real app icon in your Dock / Start Menu / Activities with its own window. Web Bluetooth still works inside the installed app, and your session history is the same `localStorage` data the browser uses.
