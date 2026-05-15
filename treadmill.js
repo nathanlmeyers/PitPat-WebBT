@@ -96,13 +96,18 @@ const KU_MAX = 6200;   // ~6.2 kph ≈ 3.85 mph — covers the Deerrun's 3.8 mph
 const PREF_UNIT    = 'treadmill_unit';
 const PREF_INCLINE = 'treadmill_incline';
 const SESSIONS_KEY = 'treadmill_sessions';
+const PROFILE_KEY  = 'treadmill_profile';
 
 const INCLINE_GRADE = 7;   // the treadmill's manual incline switch, in percent
-// Firmware doesn't fold the incline switch into its kcal count. From the ACSM
-// walking equation at ~2.5–3 mph, a 7% grade roughly raises energy cost ~1.8×
-// vs flat. This is an intentional approximation, not a per-stride model.
+// Fallback used ONLY when the user hasn't entered body metrics: firmware
+// doesn't fold the incline switch into its kcal count, so apply a flat ~1.8×
+// at 7% (ACSM walking eq, ~2.5–3 mph). Once a weight is set we integrate the
+// real ACSM equation instead (incline folded in) — see estimateKcalPerMin.
 const INCLINE_KCAL_FACTOR = 1.80;
 const KM_PER_MI = 1.609344;
+const LB_PER_KG = 2.20462;
+const CM_PER_IN = 2.54;
+const STRIDE_FACTOR = 0.414;   // walking stride ≈ 0.414 × height (unisex)
 
 // PitPat protocol default user ID — a protocol constant, NOT a personal
 // identifier. Every command packet carries the same bytes here.
@@ -121,7 +126,6 @@ const HEARTBEAT = new Uint8Array([0x6a, 0x05, 0xfd, 0xf8, 0x43]);
 const $ = id => document.getElementById(id);
 
 const connectBtn         = $('connectBtn');
-const speedDiv           = $('speed');
 const distanceDiv        = $('distance');
 const caloriesDiv        = $('calories');
 const stepsDiv           = $('steps');
@@ -148,6 +152,17 @@ const calMonth           = $('calMonth');
 const prevMonthBtn       = $('prevMonthBtn');
 const nextMonthBtn       = $('nextMonthBtn');
 const dayDetail          = $('dayDetail');
+const settingsBtn        = $('settingsBtn');
+const settingsModal      = $('settingsModal');
+const weightInput        = $('weightInput');
+const heightInput        = $('heightInput');
+const weightUnitToggle   = $('weightUnitToggle');
+const heightUnitToggle   = $('heightUnitToggle');
+const settingsCancelBtn  = $('settingsCancelBtn');
+const settingsSaveBtn    = $('settingsSaveBtn');
+const chartCaption       = $('chartCaption');
+const sessionChart       = $('sessionChart');
+const presetRow          = $('presetRow');
 const tabs   = document.querySelectorAll('.tab');
 const panels = { controls: $('controls-panel'), history: $('history-panel') };
 
@@ -170,6 +185,13 @@ let sessionStartData = null;
 let calViewDate = startOfThisMonth();
 let selectedDayKey = null;
 
+let profile = loadProfile();
+
+// Per-minute samples for the current session's chart: index = minute,
+// value = { sum, count, incline }. Reset on each new session.
+let sessionSamples = [];
+let estKcal = 0;            // ACSM-integrated kcal for the active session
+
 let toastTimer = null;
 
 
@@ -190,6 +212,27 @@ function deleteSessionByDate(dateTs) {
     saveSessions(loadSessions().filter(s => s.date !== dateTs));
     renderCalendar();
     if (selectedDayKey) renderDayDetail(selectedDayKey);
+}
+
+/**
+ * User body profile for calorie/step estimates. `weightKg`/`heightCm` are
+ * null until the user enters them (firmware numbers shown until then);
+ * `weightUnit`/`heightUnit` only remember the last input unit for redisplay.
+ */
+function loadProfile() {
+    let p = {};
+    try { p = JSON.parse(localStorage.getItem(PROFILE_KEY) || '{}') || {}; } catch {}
+    const num = v => (typeof v === 'number' && Number.isFinite(v) && v > 0) ? v : null;
+    return {
+        weightKg:   num(p.weightKg),
+        heightCm:   num(p.heightCm),
+        weightUnit: p.weightUnit === 'lb' ? 'lb' : 'kg',
+        heightUnit: p.heightUnit === 'in' ? 'in' : 'cm',
+    };
+}
+function saveProfile(p) {
+    profile = p;
+    localStorage.setItem(PROFILE_KEY, JSON.stringify(p));
 }
 
 /**
@@ -279,6 +322,39 @@ function kuToUser(ku) {
 function adjustCalories(rawKcal) {
     const n = Number(rawKcal) || 0;
     return Math.round(inclineMode === INCLINE_GRADE ? n * INCLINE_KCAL_FACTOR : n);
+}
+
+/** Canonical metric from a decoded notification (fields are in reported_unit). */
+function rawKph(raw) {
+    const v = raw.current_speed / 1000;
+    return raw.reported_unit === 'mph' ? v * KM_PER_MI : v;
+}
+function rawKm(raw) {
+    const v = raw.distance / 1000;
+    return raw.reported_unit === 'mph' ? v * KM_PER_MI : v;
+}
+
+/**
+ * ACSM walking metabolic equation. The treadmill caps ~3.8 mph, so walking
+ * (not running) applies throughout. Returns kcal per minute.
+ *   S    = speed in m/min
+ *   VO2  = 0.1·S + 1.8·S·grade + 3.5   (ml/kg/min)
+ *   kcal/min = VO2 · weightKg · 5 / 1000   (≈5 kcal per L O2)
+ * Incline is part of the formula, so no separate factor is needed here.
+ */
+function estimateKcalPerMin(speedKph, gradeFrac, weightKg) {
+    const S = speedKph * 1000 / 60;
+    const vo2 = 0.1 * S + 1.8 * S * gradeFrac + 3.5;
+    return vo2 * weightKg * 5 / 1000;
+}
+
+/** Walking stride length (m) from standing height (cm). */
+function strideMeters(heightCm) {
+    return STRIDE_FACTOR * heightCm / 100;
+}
+function estimateSteps(distanceMeters, heightCm) {
+    const stride = strideMeters(heightCm);
+    return stride > 0 ? Math.round(distanceMeters / stride) : 0;
 }
 
 /**
@@ -388,6 +464,16 @@ function handleNotification(event) {
     sendQueuedOrHeartbeat();
 }
 
+/** Bucket the current speed (canonical kph) + incline into its minute slot.
+ *  Stored in kph so a mid-session unit toggle re-scales correctly. */
+function recordSample(raw) {
+    const minute = Math.max(0, Math.floor(raw.duration / 60));
+    const slot = sessionSamples[minute] || (sessionSamples[minute] = { sum: 0, count: 0, incline: inclineMode });
+    slot.sum += rawKph(raw);
+    slot.count += 1;
+    slot.incline = inclineMode;
+}
+
 function trackSession(raw) {
     const running = raw.running_state === 1;
     if (running && !sessionActive) {
@@ -395,18 +481,26 @@ function trackSession(raw) {
         sessionStartData = {
             date: Date.now(),
             steps: raw.steps, calories: raw.calories, distance: raw.distance,
-            duration: raw.duration,
+            duration: raw.duration, prevDuration: raw.duration,
             speedSum: raw.current_speed, speedCount: 1,
             reportedUnit: raw.reported_unit,  // fixed for the run
         };
+        estKcal = 0;
+        sessionSamples = [];
+        recordSample(raw);
         upsertLiveSession();
     } else if (running && sessionStartData) {
+        const dt = Math.max(0, raw.duration - sessionStartData.prevDuration);
+        if (dt > 0 && profile.weightKg != null) {
+            estKcal += estimateKcalPerMin(rawKph(raw), inclineMode / 100, profile.weightKg) * (dt / 60);
+        }
         Object.assign(sessionStartData, {
             steps: raw.steps, calories: raw.calories, distance: raw.distance,
-            duration: raw.duration,
+            duration: raw.duration, prevDuration: raw.duration,
         });
         sessionStartData.speedSum += raw.current_speed;
         sessionStartData.speedCount += 1;
+        recordSample(raw);
         upsertLiveSession();
     } else if (!running && sessionActive) {
         finishSession();
@@ -434,11 +528,19 @@ function upsertLiveSession() {
     const distKm = repMph ? (s.distance / 1000) * KM_PER_MI : s.distance / 1000;
     const avgRaw = (s.speedSum / s.speedCount) / 1000;
     const avgKph = repMph ? avgRaw * KM_PER_MI : avgRaw;
+    // Use the profile-based estimates when available so stored history matches
+    // the live dashboard; otherwise the firmware numbers (incline-adjusted).
+    const calories = profile.weightKg != null
+        ? Math.round(estKcal)
+        : adjustCalories(s.calories);
+    const steps = profile.heightCm != null
+        ? estimateSteps(distKm * 1000, profile.heightCm)
+        : s.steps;
     const session = {
         date: s.date,
         duration: s.duration,
-        steps: s.steps,
-        calories: adjustCalories(s.calories),
+        steps,
+        calories,
         rawCalories: s.calories,
         distance: distKm,
         distanceUnit: 'km',
@@ -521,36 +623,125 @@ function setStatus(state) {
 }
 
 function buildDisplayFromRaw(raw) {
-    // Notification values are in the treadmill's reported display unit; show
-    // them in the user's chosen unit (mph<->kph uses the same factor as
-    // mi<->km, so a single conversion serves both speed and distance).
-    const reported = raw.reported_unit;             // 'kph' | 'mph'
-    const speedVal = raw.current_speed / 1000;      // in reported unit
-    const speedUser = reported === unitMode
-        ? speedVal
-        : (reported === 'kph' ? speedVal / KM_PER_MI : speedVal * KM_PER_MI);
-    const fromDist = reported === 'mph' ? 'mi' : 'km';
+    // Notification fields are in the treadmill's reported unit; rawKph/rawKm
+    // canonicalize, then we present in the user's chosen unit. Calories/steps
+    // use the profile estimate when set, else the firmware value.
     const userUnit = unitOfDistance();
+    const speedUser = unitMode === 'mph' ? rawKph(raw) / KM_PER_MI : rawKph(raw);
     return {
-        speedDisplay:    speedUser.toFixed(2) + ' ' + SPEED_RANGE[unitMode].label,
-        distanceDisplay: convertDistance(raw.distance / 1000, fromDist, userUnit).toFixed(2) + ' ' + userUnit,
-        calories:        raw.calories,
-        steps:           raw.steps,
-        duration:        raw.duration,
+        speedUser,
+        distanceDisplay: convertDistance(rawKm(raw), 'km', userUnit).toFixed(2) + ' ' + userUnit,
+        calories: profile.weightKg != null ? Math.round(estKcal) : adjustCalories(raw.calories),
+        steps:    profile.heightCm != null ? estimateSteps(rawKm(raw) * 1000, profile.heightCm) : raw.steps,
+        duration: raw.duration,
     };
 }
 
+function strong(text) {
+    const e = document.createElement('strong');
+    e.textContent = text;
+    return e;
+}
+
+function updateChartCaption(speedUser) {
+    const label = SPEED_RANGE[unitMode].label;
+    const sp = speedUser != null ? `${speedUser.toFixed(2)} ${label}` : '—';
+    chartCaption.replaceChildren('Speed ', strong(sp), ' · Incline ', strong(`${inclineMode}%`));
+}
+
 function updateDashboard(d) {
-    speedDiv.textContent    = d.speedDisplay    ?? '—';
-    distanceDiv.textContent = d.distanceDisplay ?? '—';
-    caloriesDiv.textContent = (d.calories != null) ? adjustCalories(d.calories) + ' kcal' : '—';
-    stepsDiv.textContent    = (d.steps != null) ? d.steps : '—';
-    durationDiv.textContent = (d.duration != null) ? formatDuration(d.duration) : '—';
+    distanceDiv.textContent = d?.distanceDisplay ?? '—';
+    caloriesDiv.textContent = (d?.calories != null) ? d.calories + ' kcal' : '—';
+    stepsDiv.textContent    = (d?.steps != null) ? d.steps : '—';
+    durationDiv.textContent = (d?.duration != null) ? formatDuration(d.duration) : '—';
+    updateChartCaption(d?.speedUser ?? null);
+    renderChart();
 }
 
 function refreshDashboard() {
     if (lastRaw) updateDashboard(buildDisplayFromRaw(lastRaw));
     else updateDashboard({});
+}
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function svgEl(name, attrs, cls) {
+    const el = document.createElementNS(SVG_NS, name);
+    for (const k in attrs) el.setAttribute(k, attrs[k]);
+    if (cls) el.setAttribute('class', cls);
+    return el;
+}
+
+/**
+ * Hand-rolled SVG line chart of the current session: per-minute average speed
+ * (in the user's unit) plus a faint stepped incline band. 30-minute window,
+ * extended by 30 once the user reaches minute 29 (then 59, …).
+ */
+function renderChart() {
+    if (!sessionChart) return;
+    const VB_W = 320, VB_H = 160;
+    const x0 = 30, x1 = 314, yTop = 10, yBot = 140;
+    const plotW = x1 - x0, plotH = yBot - yTop;
+
+    const lastMinute = sessionSamples.length - 1;            // -1 if empty
+    let windowMin = 30;
+    while (lastMinute >= windowMin - 1) windowMin += 30;
+
+    const speedMax = SPEED_RANGE[unitMode].max;
+    const inclineScaleMax = INCLINE_GRADE * 4;               // 7% → 25% height
+    const xFor  = m => x0 + (m / windowMin) * plotW;
+    const ySpd  = v => yBot - (Math.min(Math.max(v, 0), speedMax) / speedMax) * plotH;
+    const yInc  = i => yBot - (Math.min(i, inclineScaleMax) / inclineScaleMax) * plotH;
+
+    const frag = document.createDocumentFragment();
+
+    // axes
+    frag.appendChild(svgEl('line', { x1: x0, y1: yBot, x2: x1, y2: yBot }, 'chart-axis'));
+    frag.appendChild(svgEl('line', { x1: x0, y1: yTop, x2: x0, y2: yBot }, 'chart-axis'));
+
+    // x gridlines + minute labels every 5 min
+    for (let m = 0; m <= windowMin; m += 5) {
+        const x = xFor(m);
+        if (m > 0) frag.appendChild(svgEl('line', { x1: x, y1: yTop, x2: x, y2: yBot }, 'chart-grid'));
+        const t = svgEl('text', { x, y: yBot + 11, 'text-anchor': 'middle' }, 'chart-tick-text');
+        t.textContent = String(m);
+        frag.appendChild(t);
+    }
+    // y labels: 0 / mid / max speed
+    for (const v of [0, speedMax / 2, speedMax]) {
+        const t = svgEl('text', { x: x0 - 4, y: ySpd(v) + 3, 'text-anchor': 'end' }, 'chart-tick-text');
+        t.textContent = (Number.isInteger(v) ? v : v.toFixed(1));
+        frag.appendChild(t);
+    }
+
+    // incline stepped area (only where we have samples)
+    if (lastMinute >= 0) {
+        let dPath = `M ${x0} ${yBot}`;
+        for (let m = 0; m <= lastMinute; m++) {
+            const inc = sessionSamples[m] ? sessionSamples[m].incline : 0;
+            dPath += ` L ${xFor(m)} ${yInc(inc)} L ${xFor(m + 1)} ${yInc(inc)}`;
+        }
+        dPath += ` L ${xFor(lastMinute + 1)} ${yBot} Z`;
+        frag.appendChild(svgEl('path', { d: dPath }, 'chart-incline'));
+    }
+
+    // speed polyline (per-minute average, plotted at the minute's centre)
+    const pts = [];
+    for (let m = 0; m <= lastMinute; m++) {
+        const s = sessionSamples[m];
+        if (!s || s.count === 0) continue;
+        const avgKph = s.sum / s.count;
+        const avgDisp = unitMode === 'mph' ? avgKph / KM_PER_MI : avgKph;
+        pts.push(`${xFor(m + 0.5).toFixed(1)},${ySpd(avgDisp).toFixed(1)}`);
+    }
+    if (pts.length >= 2) {
+        frag.appendChild(svgEl('polyline', { points: pts.join(' ') }, 'chart-speed'));
+    } else if (pts.length === 1) {
+        const [cx, cy] = pts[0].split(',');
+        frag.appendChild(svgEl('circle', { cx, cy, r: 3 }, 'chart-speed'));
+    }
+
+    sessionChart.setAttribute('viewBox', `0 0 ${VB_W} ${VB_H}`);
+    sessionChart.replaceChildren(frag);
 }
 
 function enableControls(enable) {
@@ -587,6 +778,7 @@ function applyUnitToSlider() {
     curTargetSpeed = userToKU(v);
     speedSlider.value = v.toFixed(1);
     sliderValue.textContent = v.toFixed(1);
+    renderPresets();
 }
 
 function setTargetSpeed(userValue) {
@@ -595,6 +787,7 @@ function setTargetSpeed(userValue) {
     curTargetSpeed = userToKU(clamped);
     speedSlider.value = clamped.toFixed(1);
     sliderValue.textContent = clamped.toFixed(1);
+    renderPresets();
 }
 
 function setUnit(newUnit) {
@@ -828,6 +1021,86 @@ function bumpSpeed(deltaUserValue) {
     pendingCommand = makePacket('set_speed', curTargetSpeed);
 }
 
+// ---- Speed presets --------------------------------------------------------
+
+const PRESETS = { kph: [1, 2, 3, 4, 5, 6], mph: [0.5, 1, 1.5, 2, 2.5, 3, 3.5] };
+
+function renderPresets() {
+    const cur = kuToUser(curTargetSpeed);
+    presetRow.replaceChildren();
+    for (const v of PRESETS[unitMode]) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'preset-btn' + (Math.abs(v - cur) < 0.05 ? ' is-active' : '');
+        b.textContent = v % 1 === 0 ? String(v) : v.toFixed(1);
+        b.addEventListener('click', () => {
+            // 0.5 mph is below the treadmill floor (~1 kph); setTargetSpeed
+            // clamps it to SPEED_RANGE bounds.
+            setTargetSpeed(v);
+            if (connected) pendingCommand = makePacket('set_speed', curTargetSpeed);
+        });
+        presetRow.appendChild(b);
+    }
+}
+
+// ---- Settings modal -------------------------------------------------------
+
+let modalWeightUnit = 'kg';
+let modalHeightUnit = 'cm';
+
+const round1 = n => Math.round(n * 10) / 10;
+
+function openSettings() {
+    modalWeightUnit = profile.weightUnit;
+    modalHeightUnit = profile.heightUnit;
+    updateSegmentedActive(weightUnitToggle, modalWeightUnit);
+    updateSegmentedActive(heightUnitToggle, modalHeightUnit);
+    weightInput.value = profile.weightKg == null ? ''
+        : round1(modalWeightUnit === 'lb' ? profile.weightKg * LB_PER_KG : profile.weightKg);
+    heightInput.value = profile.heightCm == null ? ''
+        : round1(modalHeightUnit === 'in' ? profile.heightCm / CM_PER_IN : profile.heightCm);
+    settingsModal.hidden = false;
+}
+
+function closeSettings() { settingsModal.hidden = true; }
+
+function setModalWeightUnit(u) {
+    if (u !== 'kg' && u !== 'lb') return;
+    if (u === modalWeightUnit) return;
+    const val = parseFloat(weightInput.value);
+    if (Number.isFinite(val)) {
+        const kg = modalWeightUnit === 'lb' ? val / LB_PER_KG : val;
+        weightInput.value = round1(u === 'lb' ? kg * LB_PER_KG : kg);
+    }
+    modalWeightUnit = u;
+    updateSegmentedActive(weightUnitToggle, u);
+}
+
+function setModalHeightUnit(u) {
+    if (u !== 'cm' && u !== 'in') return;
+    if (u === modalHeightUnit) return;
+    const val = parseFloat(heightInput.value);
+    if (Number.isFinite(val)) {
+        const cm = modalHeightUnit === 'in' ? val * CM_PER_IN : val;
+        heightInput.value = round1(u === 'in' ? cm / CM_PER_IN : cm);
+    }
+    modalHeightUnit = u;
+    updateSegmentedActive(heightUnitToggle, u);
+}
+
+function saveSettings() {
+    const w = parseFloat(weightInput.value);
+    const h = parseFloat(heightInput.value);
+    const weightKg = Number.isFinite(w) && w > 0
+        ? (modalWeightUnit === 'lb' ? w / LB_PER_KG : w) : null;
+    const heightCm = Number.isFinite(h) && h > 0
+        ? (modalHeightUnit === 'in' ? h * CM_PER_IN : h) : null;
+    saveProfile({ weightKg, heightCm, weightUnit: modalWeightUnit, heightUnit: modalHeightUnit });
+    closeSettings();
+    refreshDashboard();
+    showToast(weightKg || heightCm ? 'Profile saved' : 'Profile cleared');
+}
+
 // Connect
 connectBtn.addEventListener('click', () => connected ? disconnectBluetooth() : connectBluetooth());
 
@@ -860,6 +1133,14 @@ speedSlider.addEventListener('change', () => {
 wireSegmented(unitToggle,    setUnit);
 wireSegmented(inclineToggle, setIncline);
 
+// Settings modal
+settingsBtn.addEventListener('click', openSettings);
+settingsCancelBtn.addEventListener('click', closeSettings);
+settingsSaveBtn.addEventListener('click', saveSettings);
+settingsModal.addEventListener('click', e => { if (e.target === settingsModal) closeSettings(); });
+wireSegmented(weightUnitToggle, setModalWeightUnit);
+wireSegmented(heightUnitToggle, setModalHeightUnit);
+
 // Tabs
 tabs.forEach(t => t.addEventListener('click', () => {
     tabs.forEach(x => x.classList.toggle('is-active', x === t));
@@ -882,7 +1163,7 @@ importHistoryInput.addEventListener('change', () => {
 // Init
 updateSegmentedActive(unitToggle, unitMode);
 updateSegmentedActive(inclineToggle, String(inclineMode));
-applyUnitToSlider();
-updateDashboard({});
+applyUnitToSlider();   // also renders presets
+updateDashboard({});   // also draws empty chart + caption
 updateRunningState(3);
 renderCalendar();

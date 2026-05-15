@@ -513,10 +513,111 @@ input[type="range"]:disabled { opacity: 0.5; cursor: not-allowed; }
 }
 .toast[hidden] { display: none; }
 
+/* ---- Settings button, chart, presets, modal ---- */
+
+.status-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+/* Reuse .icon-btn sizing but neutral (not danger) hover for the gear. */
+#settingsBtn { font-size: 16px; }
+#settingsBtn:hover { color: var(--text); border-color: var(--text-muted); }
+
+.chart-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 14px 10px;
+    margin-bottom: 12px;
+}
+.chart-caption {
+    font-size: 13px;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+    font-variant-numeric: tabular-nums;
+}
+.chart-caption strong { color: var(--text); font-weight: 600; }
+#sessionChart {
+    display: block;
+    width: 100%;
+    height: 160px;
+}
+.chart-axis      { stroke: var(--border); stroke-width: 1; }
+.chart-grid      { stroke: var(--border); stroke-width: 1; opacity: 0.5; }
+.chart-tick-text { fill: var(--text-muted); font-size: 9px; }
+.chart-speed     { stroke: var(--accent); stroke-width: 2; fill: none; }
+.chart-incline   { stroke: var(--warning); stroke-width: 1.5; fill: var(--warning); fill-opacity: 0.10; }
+
+.preset-row {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: 1fr;
+    gap: 6px;
+    margin-bottom: 16px;
+}
+.preset-btn {
+    border: 1px solid var(--border-strong);
+    background: var(--surface-2);
+    color: var(--text);
+    padding: 8px 0;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: border-color 0.12s, background 0.12s;
+}
+.preset-btn:hover { border-color: var(--text-muted); }
+.preset-btn.is-active { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+
+.modal-card {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+    width: min(90vw, 360px);
+    box-shadow: 0 12px 40px rgba(0,0,0,0.3);
+}
+.modal-title { margin: 0 0 4px; font-size: 18px; font-weight: 600; }
+.modal-hint  { margin: 0 0 16px; font-size: 12px; color: var(--text-muted); line-height: 1.4; }
+.field-label {
+    display: block;
+    font-size: 12px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 6px;
+}
+.field-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 14px;
+}
+.field-input {
+    flex: 1;
+    min-width: 0;
+    background: var(--bg);
+    border: 1px solid var(--border-strong);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 9px 12px;
+    font-size: 15px;
+    font-family: inherit;
+}
+.field-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 4px;
+}
+
 @media (max-width: 480px) {
     .app { padding: 16px 14px 80px; }
-    .hero-value { font-size: 48px; }
     .stats-grid { grid-template-columns: repeat(2, 1fr); }
     .cal-day { min-height: 56px; padding: 4px 4px 6px; }
     .cal-day-totals { font-size: 10px; }
+    #sessionChart { height: 140px; }
+    .preset-btn { font-size: 12px; padding: 7px 0; }
 }

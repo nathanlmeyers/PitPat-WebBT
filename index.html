@@ -29,13 +29,16 @@
             <section id="controls-panel" class="panel is-active">
                 <div class="status-row">
                     <span id="statusChip" class="chip chip-disconnected">Disconnected</span>
-                    <button id="connectBtn" class="btn btn-primary">Connect</button>
+                    <div class="status-actions">
+                        <button id="settingsBtn" class="icon-btn" aria-label="Settings">⚙</button>
+                        <button id="connectBtn" class="btn btn-primary">Connect</button>
+                    </div>
                 </div>
 
-                <div class="hero">
-                    <div class="hero-value" id="speed">—</div>
-                    <div class="hero-label">Speed</div>
-                </div>
+                <section class="chart-card">
+                    <div class="chart-caption" id="chartCaption">Speed — · Incline 0%</div>
+                    <svg id="sessionChart" viewBox="0 0 320 160" preserveAspectRatio="none" role="img" aria-label="Session speed and incline by minute"></svg>
+                </section>
 
                 <div class="stats-grid">
                     <div class="stat">
@@ -81,6 +84,8 @@
                     <input type="range" id="speedSlider" min="1" max="6" step="0.1" value="1">
                 </div>
 
+                <div class="preset-row" id="presetRow" aria-label="Speed presets"></div>
+
                 <div class="controls">
                     <button id="speedDownBtn" class="btn" disabled aria-label="Speed down">−</button>
                     <button id="startBtn" class="btn btn-go" disabled>Start</button>
@@ -116,6 +121,35 @@
     </div>
     <div id="countdownOverlay" class="overlay overlay-dark" hidden>
         <span id="countdownNumber" class="countdown-number">3</span>
+    </div>
+    <div id="settingsModal" class="overlay" hidden>
+        <div class="modal-card" role="dialog" aria-modal="true" aria-label="Settings">
+            <h2 class="modal-title">Settings</h2>
+            <p class="modal-hint">Used for calorie &amp; step estimates. Until set, the treadmill's own numbers are shown.</p>
+
+            <label class="field-label" for="weightInput">Weight</label>
+            <div class="field-row">
+                <input type="number" id="weightInput" class="field-input" inputmode="decimal" min="1" step="0.1" placeholder="—">
+                <div class="segmented" id="weightUnitToggle" role="group" aria-label="Weight unit">
+                    <button class="seg is-active" data-value="kg" type="button" aria-pressed="true">kg</button>
+                    <button class="seg" data-value="lb" type="button" aria-pressed="false">lb</button>
+                </div>
+            </div>
+
+            <label class="field-label" for="heightInput">Height</label>
+            <div class="field-row">
+                <input type="number" id="heightInput" class="field-input" inputmode="decimal" min="1" step="0.1" placeholder="—">
+                <div class="segmented" id="heightUnitToggle" role="group" aria-label="Height unit">
+                    <button class="seg is-active" data-value="cm" type="button" aria-pressed="true">cm</button>
+                    <button class="seg" data-value="in" type="button" aria-pressed="false">in</button>
+                </div>
+            </div>
+
+            <div class="modal-actions">
+                <button id="settingsCancelBtn" class="btn btn-ghost" type="button">Cancel</button>
+                <button id="settingsSaveBtn" class="btn btn-primary" type="button">Save</button>
+            </div>
+        </div>
     </div>
     <div id="toast" class="toast" hidden></div>
 
