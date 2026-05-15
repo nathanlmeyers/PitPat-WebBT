@@ -17,17 +17,20 @@
 //   9.  History       — calendar, day detail, import/export
 //  10.  Wiring & init
 //
-// Session storage shape (under `treadmill_sessions` in localStorage):
+// Session storage shape (under `treadmill_sessions` in localStorage). New
+// sessions are written canonically in metric (km / kph); the unit fields are
+// kept so older or imported records in mi/mph still convert correctly on
+// render via normalizeSession().
 //   { date: number,              // ms timestamp
 //     duration: number,          // seconds
 //     steps: number,
 //     calories: number,          // already incline-adjusted at save time
 //     rawCalories: number,       // firmware-reported, reference only
 //     distance: number,          // in `distanceUnit`
-//     distanceUnit: 'km'|'mi',
+//     distanceUnit: 'km'|'mi',   // new sessions: 'km'
 //     avgSpeed: number,          // in `speedUnit`
-//     speedUnit: 'kph'|'mph',
-//     inclineApplied: 0|3 }
+//     speedUnit: 'kph'|'mph',    // new sessions: 'kph'
+//     inclineApplied: 0|7 }
 // =============================================================================
 
 
@@ -60,7 +63,7 @@ const BLE = {
     OFFSET_CALORIES:     18,
     OFFSET_DURATION_MS:  20,
     OFFSET_FLAGS:        26,
-    FLAG_UNIT_MPH:       0x80,
+    FLAG_UNIT_MPH:       0x80,   // treadmill's on-screen unit; speed value stays metric
     FLAG_STATE_MASK:     0x18,
     FLAG_STATE_STARTING: 0x18,
     FLAG_STATE_RUNNING:  0x08,
@@ -72,19 +75,32 @@ const BLE = {
     CMD_KPH_MASK:        0xF7,   // AND into byte 12 to force kph
 };
 
-/** Speed slider ranges, in the user's selected unit. The treadmill firmware
- *  interprets the speed field in whatever unit the command bit selects, so
- *  `curTargetSpeed` is always `userValue * 1000` regardless of unit. */
+/** Speed slider ranges, expressed in the user's selected display unit. */
 const SPEED_RANGE = {
     kph: { min: 1.0, max: 6.0, label: 'kph' },
-    mph: { min: 0.6, max: 3.7, label: 'mph' },
+    mph: { min: 0.7, max: 3.8, label: 'mph' },
 };
+
+/**
+ * The treadmill's speed command is ALWAYS kph × 1000 internally, no matter
+ * which unit its screen shows — the unit bit in the command byte only changes
+ * the on-screen label, not how the speed value is interpreted. So we keep the
+ * target in those native units and convert to/from the user's unit purely for
+ * the slider and the readout. (Sending "3.7" while meaning 3.7 mph made the
+ * belt run at 3.7 kph ≈ 2.3 mph — the original calibration bug.)
+ */
+const KU_MIN = 1000;   // 1.0 kph
+const KU_MAX = 6200;   // ~6.2 kph ≈ 3.85 mph — covers the Deerrun's 3.8 mph cap
 
 const PREF_UNIT    = 'treadmill_unit';
 const PREF_INCLINE = 'treadmill_incline';
 const SESSIONS_KEY = 'treadmill_sessions';
 
-const INCLINE_KCAL_FACTOR = 1.30;        // ~30% boost at 3% grade
+const INCLINE_GRADE = 7;   // the treadmill's manual incline switch, in percent
+// Firmware doesn't fold the incline switch into its kcal count. From the ACSM
+// walking equation at ~2.5–3 mph, a 7% grade roughly raises energy cost ~1.8×
+// vs flat. This is an intentional approximation, not a per-stride model.
+const INCLINE_KCAL_FACTOR = 1.80;
 const KM_PER_MI = 1.609344;
 
 // PitPat protocol default user ID — a protocol constant, NOT a personal
@@ -138,12 +154,12 @@ const panels = { controls: $('controls-panel'), history: $('history-panel') };
 // ---- 3. State -------------------------------------------------------------
 
 let unitMode    = localStorage.getItem(PREF_UNIT)    === 'mph' ? 'mph' : 'kph';
-let inclineMode = localStorage.getItem(PREF_INCLINE) === '3'   ? 3 : 0;
+let inclineMode = localStorage.getItem(PREF_INCLINE) === String(INCLINE_GRADE) ? INCLINE_GRADE : 0;
 
 let device = null, server = null, notifyChar = null, writeChar = null;
 let connected = false;
 let runningState = 3;       // 0 Starting · 1 Running · 2 Paused · 3 Stopped
-let curTargetSpeed = 1000;  // user-facing target × 1000
+let curTargetSpeed = 1000;  // treadmill speed command — kph × 1000 (unit-independent)
 
 let lastRaw = null;         // most recent decoded notification (for re-render)
 let pendingCommand = null;  // queued packet, sent on next notification tick
@@ -205,7 +221,7 @@ function cleanSession(raw) {
         distanceUnit,
         avgSpeed:       Math.max(0, num(raw.avgSpeed)),
         speedUnit,
-        inclineApplied: raw.inclineApplied === 3 ? 3 : 0,
+        inclineApplied: raw.inclineApplied === INCLINE_GRADE ? INCLINE_GRADE : 0,
     };
 }
 
@@ -241,13 +257,27 @@ function convertDistance(value, from, to) {
     return from === 'km' ? value / KM_PER_MI : value * KM_PER_MI;
 }
 
+/** User-facing speed (in the current unit) → native treadmill units (kph×1000). */
+function userToKU(v) {
+    const ku = unitMode === 'mph'
+        ? Math.round(v * KM_PER_MI * 1000)
+        : Math.round(v * 1000);
+    return Math.min(KU_MAX, Math.max(KU_MIN, ku));
+}
+
+/** Native treadmill units (kph×1000) → user-facing value in the current unit. */
+function kuToUser(ku) {
+    const kph = ku / 1000;
+    return unitMode === 'mph' ? kph / KM_PER_MI : kph;
+}
+
 /**
- * Firmware doesn't account for the 3% incline switch in its calorie count.
- * Apply a flat correction when the user has selected 3% in the UI.
+ * Firmware doesn't fold the manual incline switch into its calorie count.
+ * Apply a flat correction when the user has selected the incline grade.
  */
 function adjustCalories(rawKcal) {
     const n = Number(rawKcal) || 0;
-    return Math.round(inclineMode === 3 ? n * INCLINE_KCAL_FACTOR : n);
+    return Math.round(inclineMode === INCLINE_GRADE ? n * INCLINE_KCAL_FACTOR : n);
 }
 
 /**
@@ -325,12 +355,11 @@ function decodeNotification(value) {
         stateBits === BLE.FLAG_STATE_PAUSED   ? 2 : 3;
 
     return {
-        current_speed: u16(BLE.OFFSET_CURRENT_SPEED),
-        distance:      u32(BLE.OFFSET_DISTANCE),
+        current_speed: u16(BLE.OFFSET_CURRENT_SPEED),  // kph × 1000
+        distance:      u32(BLE.OFFSET_DISTANCE),        // metres
         calories:      u16(BLE.OFFSET_CALORIES),
         steps:         u32(BLE.OFFSET_STEPS),
         duration:      Math.round(u32(BLE.OFFSET_DURATION_MS) / 1000),
-        speed_unit:    (flags & BLE.FLAG_UNIT_MPH) ? 'mph' : 'kph',
         running_state,
     };
 }
@@ -363,7 +392,6 @@ function trackSession(raw) {
             steps: raw.steps, calories: raw.calories, distance: raw.distance,
             duration: raw.duration,
             speedSum: raw.current_speed, speedCount: 1,
-            speedUnit: raw.speed_unit,
         };
         upsertLiveSession();
     } else if (running && sessionStartData) {
@@ -393,16 +421,18 @@ function sendQueuedOrHeartbeat() {
 function upsertLiveSession() {
     if (!sessionStartData) return;
     const s = sessionStartData;
+    // Stored canonically in metric (the treadmill's native units); the
+    // calendar/detail views convert to the user's chosen unit on render.
     const session = {
         date: s.date,
         duration: s.duration,
         steps: s.steps,
         calories: adjustCalories(s.calories),
         rawCalories: s.calories,
-        distance: s.distance / 1000,
-        distanceUnit: s.speedUnit === 'mph' ? 'mi' : 'km',
-        avgSpeed: (s.speedSum / s.speedCount) / 1000,
-        speedUnit: s.speedUnit,
+        distance: s.distance / 1000,           // km
+        distanceUnit: 'km',
+        avgSpeed: (s.speedSum / s.speedCount) / 1000,  // kph
+        speedUnit: 'kph',
         inclineApplied: inclineMode,
     };
     const sessions = loadSessions();
@@ -427,19 +457,20 @@ function finishSession() {
  *   [0]      START_BYTE (0x6A)
  *   [1]      length (0x17 = 23)
  *   [2..5]   reserved (zero)
- *   [6..7]   target speed × 1000 (big-endian u16, in current unit)
+ *   [6..7]   target speed, kph × 1000 (big-endian u16). ALWAYS kph — the
+ *            unit bit below only changes the treadmill's on-screen label.
  *   [8]      magic: 5 for set_speed, 1 otherwise
- *   [9]      incline (always 0 — PitPat incline is mechanical)
+ *   [9]      incline (always 0 — incline is a mechanical switch)
  *   [10]     weight (kg; default 80)
  *   [11]     reserved
  *   [12]     command nibble + unit bit. 4=start, 2=pause, 0=stop.
- *            OR 0x08 (CMD_UNIT_MPH_BIT) when speaking mph.
+ *            OR 0x08 (CMD_UNIT_MPH_BIT) to label the screen in mph.
  *   [13..20] user ID (8 bytes; protocol-default constant)
  *   [21]     XOR checksum of bytes 1..20
  *   [22]     END_BYTE (0x43)
  *
  * @param {'start'|'pause'|'stop'|'set_speed'} type
- * @param {number} [speed=1000] user-facing speed × 1000
+ * @param {number} [speed=1000] target speed in kph × 1000
  * @returns {Uint8Array}
  */
 function makePacket(type, speed = 1000) {
@@ -479,12 +510,12 @@ function setStatus(state) {
 }
 
 function buildDisplayFromRaw(raw) {
-    const distVal = raw.distance / 1000;
-    const fromUnit = raw.speed_unit === 'mph' ? 'mi' : 'km';
+    // The treadmill reports metric internally (speed = kph×1000, distance =
+    // metres) regardless of its on-screen unit; present in the user's unit.
     const userUnit = unitOfDistance();
     return {
-        speedDisplay:    (raw.current_speed / 1000).toFixed(2) + ' ' + raw.speed_unit,
-        distanceDisplay: convertDistance(distVal, fromUnit, userUnit).toFixed(2) + ' ' + userUnit,
+        speedDisplay:    kuToUser(raw.current_speed).toFixed(2) + ' ' + SPEED_RANGE[unitMode].label,
+        distanceDisplay: convertDistance(raw.distance / 1000, 'km', userUnit).toFixed(2) + ' ' + userUnit,
         calories:        raw.calories,
         steps:           raw.steps,
         duration:        raw.duration,
@@ -532,15 +563,18 @@ function applyUnitToSlider() {
     speedSlider.max  = String(r.max);
     speedSlider.step = '0.1';
     sliderUnit.textContent = ' ' + r.label;
-    const v = curTargetSpeed / 1000;
-    speedSlider.value = String(v);
+    // Clamp the displayed value into range and resync curTargetSpeed so the
+    // slider and the queued command never diverge.
+    const v = Math.min(r.max, Math.max(r.min, kuToUser(curTargetSpeed)));
+    curTargetSpeed = userToKU(v);
+    speedSlider.value = v.toFixed(1);
     sliderValue.textContent = v.toFixed(1);
 }
 
 function setTargetSpeed(userValue) {
     const r = SPEED_RANGE[unitMode];
     const clamped = Math.min(r.max, Math.max(r.min, userValue));
-    curTargetSpeed = Math.round(clamped * 1000);
+    curTargetSpeed = userToKU(clamped);
     speedSlider.value = clamped.toFixed(1);
     sliderValue.textContent = clamped.toFixed(1);
 }
@@ -548,23 +582,20 @@ function setTargetSpeed(userValue) {
 function setUnit(newUnit) {
     if (newUnit !== 'kph' && newUnit !== 'mph') return;
     if (newUnit === unitMode) return;
-    // Convert curTargetSpeed so the physical pace stays the same.
-    const converted = unitMode === 'kph'
-        ? (curTargetSpeed / 1000) / KM_PER_MI
-        : (curTargetSpeed / 1000) * KM_PER_MI;
     unitMode = newUnit;
     localStorage.setItem(PREF_UNIT, unitMode);
     updateSegmentedActive(unitToggle, unitMode);
-    setTargetSpeed(converted);
+    // curTargetSpeed is in native units (unit-independent); only the
+    // slider/readout presentation changes — the physical target is unchanged,
+    // so there's no need to resend a command.
     applyUnitToSlider();
     refreshDashboard();
     renderCalendar();
     if (selectedDayKey) renderDayDetail(selectedDayKey);
-    if (connected) pendingCommand = makePacket('set_speed', curTargetSpeed);
 }
 
 function setIncline(newIncline) {
-    const n = Number(newIncline) === 3 ? 3 : 0;
+    const n = Number(newIncline) === INCLINE_GRADE ? INCLINE_GRADE : 0;
     if (n === inclineMode) return;
     inclineMode = n;
     localStorage.setItem(PREF_INCLINE, String(inclineMode));
@@ -775,7 +806,7 @@ function showToast(message, timeout = 3500) {
 
 function bumpSpeed(deltaUserValue) {
     if (!connected) return;
-    setTargetSpeed(curTargetSpeed / 1000 + deltaUserValue);
+    setTargetSpeed(kuToUser(curTargetSpeed) + deltaUserValue);
     pendingCommand = makePacket('set_speed', curTargetSpeed);
 }
 
@@ -803,7 +834,7 @@ speedSlider.addEventListener('input', () => {
     sliderValue.textContent = parseFloat(speedSlider.value).toFixed(1);
 });
 speedSlider.addEventListener('change', () => {
-    curTargetSpeed = Math.round(parseFloat(speedSlider.value) * 1000);
+    setTargetSpeed(parseFloat(speedSlider.value));
     if (connected) pendingCommand = makePacket('set_speed', curTargetSpeed);
 });
 

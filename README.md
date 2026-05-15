@@ -6,8 +6,8 @@ A web-based dashboard to control and monitor a PitPat treadmill via Bluetooth. F
 
 - Connect, start/stop, pause, and adjust speed over Web Bluetooth
 - Minimal, modern UI with automatic light/dark mode
-- **KPH/MPH toggle** — re-bounds the slider, converts the target speed, and switches the treadmill's display unit
-- **0% / 3% incline mode** — bumps calorie totals by ~30% at 3% (the treadmill itself doesn't adjust for the manual incline switch)
+- **KPH/MPH toggle** — re-bounds the slider and converts the readout. The treadmill's speed command is always metric internally, so the controller converts your chosen pace to the treadmill's native units before sending it
+- **0% / 7% incline mode** — bumps calorie totals by ~80% at 7% (the treadmill itself doesn't adjust for the manual incline switch)
 - **Monthly history calendar** — per-day distance and calories, click a day to see and delete individual sessions
 - Import / export session history as JSON
 
