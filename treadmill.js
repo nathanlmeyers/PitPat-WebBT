@@ -475,16 +475,16 @@ function handleNotification(event) {
     sendQueuedOrHeartbeat();
 }
 
-/** Bucket the current speed (canonical kph), incline, and cumulative step
- *  count into the minute slot. Speed stored in kph so a mid-session unit
- *  toggle re-scales correctly; steps is the running total at the end of the
- *  minute (last write wins). */
+/** Record the minute slot for the chart. We store the LAST sample of each
+ *  minute (the belt's actual speed/incline at that point) rather than the
+ *  minute average — averaging dragged the line above the live treadmill
+ *  reading whenever the speed had been changed within the minute. Speed is
+ *  kept in canonical kph so a mid-session unit toggle re-scales correctly. */
 function recordSample(raw) {
     const minute = Math.max(0, Math.floor(raw.duration / 60));
     const slot = sessionSamples[minute] ||
-        (sessionSamples[minute] = { sum: 0, count: 0, incline: inclineMode, steps: 0 });
-    slot.sum += rawKph(raw);
-    slot.count += 1;
+        (sessionSamples[minute] = { kph: 0, incline: inclineMode, steps: 0 });
+    slot.kph = rawKph(raw);
     slot.incline = inclineMode;
     slot.steps = profile.heightCm != null ? Math.round(estSteps) : raw.steps;
 }
@@ -752,14 +752,13 @@ function renderChart() {
         frag.appendChild(svgEl('path', { d: dPath }, 'chart-incline'));
     }
 
-    // speed polyline (per-minute average, plotted at the minute's centre)
+    // speed polyline: last sample of each minute, plotted at the minute centre
     const pts = [];
     for (let m = 0; m <= lastMinute; m++) {
         const s = sessionSamples[m];
-        if (!s || s.count === 0) continue;
-        const avgKph = s.sum / s.count;
-        const avgDisp = unitMode === 'mph' ? avgKph / KM_PER_MI : avgKph;
-        pts.push(`${xFor(m + 0.5).toFixed(1)},${ySpd(avgDisp).toFixed(1)}`);
+        if (!s) continue;
+        const disp = unitMode === 'mph' ? s.kph / KM_PER_MI : s.kph;
+        pts.push(`${xFor(m + 0.5).toFixed(1)},${ySpd(disp).toFixed(1)}`);
     }
     if (pts.length >= 2) {
         frag.appendChild(svgEl('polyline', { points: pts.join(' ') }, 'chart-speed'));
@@ -772,7 +771,7 @@ function renderChart() {
     const stepPts = [];
     for (let m = 0; m <= lastMinute; m++) {
         const s = sessionSamples[m];
-        if (!s || s.count === 0) continue;
+        if (!s) continue;
         stepPts.push(`${xFor(m + 0.5).toFixed(1)},${yStep(s.steps).toFixed(1)}`);
     }
     if (stepPts.length >= 2) {
