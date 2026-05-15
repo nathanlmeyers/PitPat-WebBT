@@ -160,7 +160,6 @@ const weightUnitToggle   = $('weightUnitToggle');
 const heightUnitToggle   = $('heightUnitToggle');
 const settingsCancelBtn  = $('settingsCancelBtn');
 const settingsSaveBtn    = $('settingsSaveBtn');
-const chartCaption       = $('chartCaption');
 const sessionChart       = $('sessionChart');
 const presetRow          = $('presetRow');
 const tabs   = document.querySelectorAll('.tab');
@@ -282,16 +281,15 @@ function dayKey(d) {
     return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 }
 
+/** Stopwatch style: "0:00", "12:34", or "1:02:03" once it passes an hour. */
 function formatDuration(seconds) {
     seconds = Math.max(0, Math.floor(Number(seconds) || 0));
     const h = Math.floor(seconds / 3600);
     const m = Math.floor((seconds % 3600) / 60);
-    const s = seconds % 60;
-    const parts = [];
-    if (h > 0) parts.push(h + 'h');
-    if (m > 0 || h > 0) parts.push(m + 'm');
-    parts.push(s + 's');
-    return parts.join(' ');
+    const s = String(seconds % 60).padStart(2, '0');
+    return h > 0
+        ? `${h}:${String(m).padStart(2, '0')}:${s}`
+        : `${m}:${s}`;
 }
 
 function unitOfDistance() { return unitMode === 'mph' ? 'mi' : 'km'; }
@@ -633,9 +631,7 @@ function buildDisplayFromRaw(raw) {
     // canonicalize, then we present in the user's chosen unit. Calories/steps
     // use the profile estimate when set, else the firmware value.
     const userUnit = unitOfDistance();
-    const speedUser = unitMode === 'mph' ? rawKph(raw) / KM_PER_MI : rawKph(raw);
     return {
-        speedUser,
         distanceDisplay: convertDistance(rawKm(raw), 'km', userUnit).toFixed(2) + ' ' + userUnit,
         calories: profile.weightKg != null ? Math.round(estKcal) : adjustCalories(raw.calories),
         steps:    profile.heightCm != null ? estimateSteps(rawKm(raw) * 1000, profile.heightCm) : raw.steps,
@@ -643,24 +639,11 @@ function buildDisplayFromRaw(raw) {
     };
 }
 
-function strong(text) {
-    const e = document.createElement('strong');
-    e.textContent = text;
-    return e;
-}
-
-function updateChartCaption(speedUser) {
-    const label = SPEED_RANGE[unitMode].label;
-    const sp = speedUser != null ? `${speedUser.toFixed(2)} ${label}` : '—';
-    chartCaption.replaceChildren('Speed ', strong(sp), ' · Incline ', strong(`${inclineMode}%`));
-}
-
 function updateDashboard(d) {
     distanceDiv.textContent = d?.distanceDisplay ?? '—';
     caloriesDiv.textContent = (d?.calories != null) ? d.calories + ' kcal' : '—';
     stepsDiv.textContent    = (d?.steps != null) ? d.steps : '—';
     durationDiv.textContent = (d?.duration != null) ? formatDuration(d.duration) : '—';
-    updateChartCaption(d?.speedUser ?? null);
     renderChart();
 }
 
@@ -1066,7 +1049,8 @@ function bumpSpeed(deltaUserValue) {
 
 // ---- Speed presets --------------------------------------------------------
 
-const PRESETS = { kph: [1, 2, 3, 4, 5, 6], mph: [0.5, 1, 1.5, 2, 2.5, 3, 3.5] };
+// 0.7 mph is the treadmill's floor (≈1 kph); kph starts at 1.
+const PRESETS = { kph: [1, 2, 3, 4, 5, 6], mph: [0.7, 1, 1.5, 2, 2.5, 3, 3.5] };
 
 function renderPresets() {
     const cur = kuToUser(curTargetSpeed);
@@ -1077,8 +1061,6 @@ function renderPresets() {
         b.className = 'preset-btn' + (Math.abs(v - cur) < 0.05 ? ' is-active' : '');
         b.textContent = v % 1 === 0 ? String(v) : v.toFixed(1);
         b.addEventListener('click', () => {
-            // 0.5 mph is below the treadmill floor (~1 kph); setTargetSpeed
-            // clamps it to SPEED_RANGE bounds.
             setTargetSpeed(v);
             if (connected) pendingCommand = makePacket('set_speed', curTargetSpeed);
         });

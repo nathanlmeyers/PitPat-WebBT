@@ -528,16 +528,9 @@ input[type="range"]:disabled { opacity: 0.5; cursor: not-allowed; }
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    padding: 14px 14px 10px;
+    padding: 12px 14px 10px;
     margin-bottom: 12px;
 }
-.chart-caption {
-    font-size: 13px;
-    color: var(--text-muted);
-    margin-bottom: 8px;
-    font-variant-numeric: tabular-nums;
-}
-.chart-caption strong { color: var(--text); font-weight: 600; }
 #sessionChart {
     display: block;
     width: 100%;
