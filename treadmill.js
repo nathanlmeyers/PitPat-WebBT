@@ -160,8 +160,16 @@ const weightUnitToggle   = $('weightUnitToggle');
 const heightUnitToggle   = $('heightUnitToggle');
 const settingsCancelBtn  = $('settingsCancelBtn');
 const settingsSaveBtn    = $('settingsSaveBtn');
+const tileChecks = {
+    distance: $('tileDistance'),
+    calories: $('tileCalories'),
+    steps:    $('tileSteps'),
+    duration: $('tileDuration'),
+};
 const sessionChart       = $('sessionChart');
 const presetRow          = $('presetRow');
+const lifeDistance       = $('lifeDistance');
+const lifeSteps          = $('lifeSteps');
 const tabs   = document.querySelectorAll('.tab');
 const panels = { controls: $('controls-panel'), history: $('history-panel') };
 
@@ -190,6 +198,7 @@ let profile = loadProfile();
 // value = { sum, count, incline }. Reset on each new session.
 let sessionSamples = [];
 let estKcal = 0;            // ACSM-integrated kcal for the active session
+let estSteps = 0;           // speed-integrated step count (smooth, profile-based)
 
 let toastTimer = null;
 
@@ -222,11 +231,19 @@ function loadProfile() {
     let p = {};
     try { p = JSON.parse(localStorage.getItem(PROFILE_KEY) || '{}') || {}; } catch {}
     const num = v => (typeof v === 'number' && Number.isFinite(v) && v > 0) ? v : null;
+    const t = p.tiles && typeof p.tiles === 'object' ? p.tiles : {};
+    const onByDefault = k => t[k] !== false;   // missing → shown
     return {
         weightKg:   num(p.weightKg),
         heightCm:   num(p.heightCm),
         weightUnit: p.weightUnit === 'lb' ? 'lb' : 'kg',
         heightUnit: p.heightUnit === 'in' ? 'in' : 'cm',
+        tiles: {
+            distance: onByDefault('distance'),
+            calories: onByDefault('calories'),
+            steps:    onByDefault('steps'),
+            duration: onByDefault('duration'),
+        },
     };
 }
 function saveProfile(p) {
@@ -350,10 +367,6 @@ function estimateKcalPerMin(speedKph, gradeFrac, weightKg) {
 function strideMeters(heightCm) {
     return STRIDE_FACTOR * heightCm / 100;
 }
-function estimateSteps(distanceMeters, heightCm) {
-    const stride = strideMeters(heightCm);
-    return stride > 0 ? Math.round(distanceMeters / stride) : 0;
-}
 
 /**
  * Project a stored session onto `{ date, distance, calories }` in the user's
@@ -473,9 +486,7 @@ function recordSample(raw) {
     slot.sum += rawKph(raw);
     slot.count += 1;
     slot.incline = inclineMode;
-    slot.steps = profile.heightCm != null
-        ? estimateSteps(rawKm(raw) * 1000, profile.heightCm)
-        : raw.steps;
+    slot.steps = profile.heightCm != null ? Math.round(estSteps) : raw.steps;
 }
 
 function trackSession(raw) {
@@ -490,6 +501,7 @@ function trackSession(raw) {
             reportedUnit: raw.reported_unit,  // fixed for the run
         };
         estKcal = 0;
+        estSteps = 0;
         sessionSamples = [];
         recordSample(raw);
         upsertLiveSession();
@@ -497,6 +509,12 @@ function trackSession(raw) {
         const dt = Math.max(0, raw.duration - sessionStartData.prevDuration);
         if (dt > 0 && profile.weightKg != null) {
             estKcal += estimateKcalPerMin(rawKph(raw), inclineMode / 100, profile.weightKg) * (dt / 60);
+        }
+        if (dt > 0 && profile.heightCm != null) {
+            // Integrate speed×time so the count rises every tick instead of
+            // jumping with the treadmill's coarse distance field.
+            const metres = rawKph(raw) * 1000 * (dt / 3600);
+            estSteps += metres / strideMeters(profile.heightCm);
         }
         Object.assign(sessionStartData, {
             steps: raw.steps, calories: raw.calories, distance: raw.distance,
@@ -537,9 +555,7 @@ function upsertLiveSession() {
     const calories = profile.weightKg != null
         ? Math.round(estKcal)
         : adjustCalories(s.calories);
-    const steps = profile.heightCm != null
-        ? estimateSteps(distKm * 1000, profile.heightCm)
-        : s.steps;
+    const steps = profile.heightCm != null ? Math.round(estSteps) : s.steps;
     const session = {
         date: s.date,
         duration: s.duration,
@@ -634,7 +650,7 @@ function buildDisplayFromRaw(raw) {
     return {
         distanceDisplay: convertDistance(rawKm(raw), 'km', userUnit).toFixed(2) + ' ' + userUnit,
         calories: profile.weightKg != null ? Math.round(estKcal) : adjustCalories(raw.calories),
-        steps:    profile.heightCm != null ? estimateSteps(rawKm(raw) * 1000, profile.heightCm) : raw.steps,
+        steps:    profile.heightCm != null ? Math.round(estSteps) : raw.steps,
         duration: raw.duration,
     };
 }
@@ -867,7 +883,21 @@ function aggregateByDay(sessions) {
     return map;
 }
 
+/** All-time totals across stored sessions: distance (user's unit) + steps. */
+function renderLifetime() {
+    let dist = 0, steps = 0;
+    for (const s of loadSessions()) {
+        const n = normalizeSession(s);
+        if (!n) continue;
+        dist += n.distance;
+        steps += Number(s.steps) || 0;
+    }
+    lifeDistance.textContent = dist.toFixed(2) + ' ' + unitOfDistance();
+    lifeSteps.textContent = Math.round(steps).toLocaleString();
+}
+
 function renderCalendar() {
+    renderLifetime();
     const { startOfMonth, endOfMonth, eachDayOfInterval, format } = window.dateFns;
     calMonth.textContent = format(calViewDate, 'MMMM yyyy');
 
@@ -1084,10 +1114,19 @@ function openSettings() {
         : round1(modalWeightUnit === 'lb' ? profile.weightKg * LB_PER_KG : profile.weightKg);
     heightInput.value = profile.heightCm == null ? ''
         : round1(modalHeightUnit === 'in' ? profile.heightCm / CM_PER_IN : profile.heightCm);
+    for (const k in tileChecks) tileChecks[k].checked = profile.tiles[k];
     settingsModal.hidden = false;
 }
 
 function closeSettings() { settingsModal.hidden = true; }
+
+/** Show/hide each dashboard tile per profile.tiles. */
+function applyTileVisibility() {
+    for (const k in tileChecks) {
+        const el = document.querySelector(`.stat[data-tile="${k}"]`);
+        if (el) el.classList.toggle('is-hidden', !profile.tiles[k]);
+    }
+}
 
 function setModalWeightUnit(u) {
     if (u !== 'kg' && u !== 'lb') return;
@@ -1120,10 +1159,13 @@ function saveSettings() {
         ? (modalWeightUnit === 'lb' ? w / LB_PER_KG : w) : null;
     const heightCm = Number.isFinite(h) && h > 0
         ? (modalHeightUnit === 'in' ? h * CM_PER_IN : h) : null;
-    saveProfile({ weightKg, heightCm, weightUnit: modalWeightUnit, heightUnit: modalHeightUnit });
+    const tiles = {};
+    for (const k in tileChecks) tiles[k] = tileChecks[k].checked;
+    saveProfile({ weightKg, heightCm, weightUnit: modalWeightUnit, heightUnit: modalHeightUnit, tiles });
     closeSettings();
+    applyTileVisibility();
     refreshDashboard();
-    showToast(weightKg || heightCm ? 'Profile saved' : 'Profile cleared');
+    showToast('Settings saved');
 }
 
 // Connect
@@ -1191,7 +1233,8 @@ window.addEventListener('resize', renderChart);
 // Init
 updateSegmentedActive(unitToggle, unitMode);
 updateSegmentedActive(inclineToggle, String(inclineMode));
+applyTileVisibility();
 applyUnitToSlider();   // also renders presets
-updateDashboard({});   // also draws empty chart + caption
+updateDashboard({});   // also draws empty chart
 updateRunningState(3);
-renderCalendar();
+renderCalendar();      // also renders lifetime totals

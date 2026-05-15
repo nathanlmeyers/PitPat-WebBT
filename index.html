@@ -13,7 +13,7 @@
     <meta name="apple-mobile-web-app-title" content="PitPat">
     <meta name="mobile-web-app-capable" content="yes">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self'; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-ancestors 'none'">
-    <link rel="stylesheet" href="styles.css?v=20260515c">
+    <link rel="stylesheet" href="styles.css?v=20260515d">
 </head>
 <body>
     <div class="app">
@@ -40,19 +40,19 @@
                 </section>
 
                 <div class="stats-grid">
-                    <div class="stat">
+                    <div class="stat" data-tile="distance">
                         <div class="stat-label">Distance</div>
                         <div class="stat-value" id="distance">—</div>
                     </div>
-                    <div class="stat">
+                    <div class="stat" data-tile="calories">
                         <div class="stat-label">Calories</div>
                         <div class="stat-value" id="calories">—</div>
                     </div>
-                    <div class="stat">
+                    <div class="stat" data-tile="steps">
                         <div class="stat-label">Steps</div>
                         <div class="stat-value" id="steps">—</div>
                     </div>
-                    <div class="stat">
+                    <div class="stat" data-tile="duration">
                         <div class="stat-label">Duration</div>
                         <div class="stat-value" id="duration">—</div>
                     </div>
@@ -94,6 +94,16 @@
             </section>
 
             <section id="history-panel" class="panel">
+                <div class="lifetime">
+                    <div class="lifetime-item">
+                        <div class="lifetime-label">Total distance</div>
+                        <div class="lifetime-value" id="lifeDistance">—</div>
+                    </div>
+                    <div class="lifetime-item">
+                        <div class="lifetime-label">Total steps</div>
+                        <div class="lifetime-value" id="lifeSteps">—</div>
+                    </div>
+                </div>
                 <div class="history-actions">
                     <button id="exportHistoryBtn" class="btn btn-ghost">Export</button>
                     <button id="importHistoryBtn" class="btn btn-ghost">Import</button>
@@ -144,6 +154,14 @@
                 </div>
             </div>
 
+            <span class="field-label">Show tiles</span>
+            <div class="tile-checks">
+                <label><input type="checkbox" id="tileDistance" checked> Distance</label>
+                <label><input type="checkbox" id="tileCalories" checked> Calories</label>
+                <label><input type="checkbox" id="tileSteps" checked> Steps</label>
+                <label><input type="checkbox" id="tileDuration" checked> Duration</label>
+            </div>
+
             <div class="modal-actions">
                 <button id="settingsCancelBtn" class="btn btn-ghost" type="button">Cancel</button>
                 <button id="settingsSaveBtn" class="btn btn-primary" type="button">Save</button>
@@ -156,6 +174,6 @@
             integrity="sha384-N5s9V3fxQzmwvcYVU2BIsnjPgkKEv7vmWgJ402BvM1N8LMhLT5dcX4cFwxWxpWu6"
             crossorigin="anonymous"
             referrerpolicy="no-referrer"></script>
-    <script type="module" src="treadmill.js?v=20260515c"></script>
+    <script type="module" src="treadmill.js?v=20260515d"></script>
 </body>
 </html>
