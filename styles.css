@@ -547,7 +547,9 @@ input[type="range"]:disabled { opacity: 0.5; cursor: not-allowed; }
 .chart-grid      { stroke: var(--border); stroke-width: 1; opacity: 0.5; }
 .chart-tick-text { fill: var(--text-muted); font-size: 9px; }
 .chart-speed     { stroke: var(--accent); stroke-width: 2; fill: none; }
+.chart-steps     { stroke: var(--success); stroke-width: 2; fill: var(--success); }
 .chart-incline   { stroke: var(--warning); stroke-width: 1.5; fill: var(--warning); fill-opacity: 0.10; }
+polyline.chart-steps { fill: none; }
 
 .preset-row {
     display: grid;

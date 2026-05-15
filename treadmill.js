@@ -464,14 +464,20 @@ function handleNotification(event) {
     sendQueuedOrHeartbeat();
 }
 
-/** Bucket the current speed (canonical kph) + incline into its minute slot.
- *  Stored in kph so a mid-session unit toggle re-scales correctly. */
+/** Bucket the current speed (canonical kph), incline, and cumulative step
+ *  count into the minute slot. Speed stored in kph so a mid-session unit
+ *  toggle re-scales correctly; steps is the running total at the end of the
+ *  minute (last write wins). */
 function recordSample(raw) {
     const minute = Math.max(0, Math.floor(raw.duration / 60));
-    const slot = sessionSamples[minute] || (sessionSamples[minute] = { sum: 0, count: 0, incline: inclineMode });
+    const slot = sessionSamples[minute] ||
+        (sessionSamples[minute] = { sum: 0, count: 0, incline: inclineMode, steps: 0 });
     slot.sum += rawKph(raw);
     slot.count += 1;
     slot.incline = inclineMode;
+    slot.steps = profile.heightCm != null
+        ? estimateSteps(rawKm(raw) * 1000, profile.heightCm)
+        : raw.steps;
 }
 
 function trackSession(raw) {
@@ -672,9 +678,10 @@ function svgEl(name, attrs, cls) {
 }
 
 /**
- * Hand-rolled SVG line chart of the current session: per-minute average speed
- * (in the user's unit) plus a faint stepped incline band. 30-minute window,
- * extended by 30 once the user reaches minute 29 (then 59, …).
+ * Hand-rolled SVG chart of the current session: per-minute average speed on
+ * the left axis, cumulative steps on the right axis, plus a faint stepped
+ * incline band. 30-minute window, extended by 30 once the user reaches minute
+ * 29 (then 59, …). Steps axis starts at 2000, grows by 1000 past 75% full.
  */
 function renderChart() {
     if (!sessionChart) return;
@@ -682,7 +689,7 @@ function renderChart() {
     // text isn't stretched — preserveAspectRatio default keeps it 1:1.
     const VB_H = 160;
     const VB_W = Math.round(sessionChart.clientWidth) || 320;
-    const x0 = 30, x1 = VB_W - 6, yTop = 10, yBot = 140;
+    const x0 = 30, x1 = VB_W - 30, yTop = 10, yBot = 140;  // right margin = steps axis
     const plotW = x1 - x0, plotH = yBot - yTop;
 
     const lastMinute = sessionSamples.length - 1;            // -1 if empty
@@ -691,15 +698,25 @@ function renderChart() {
 
     const speedMax = SPEED_RANGE[unitMode].max;
     const inclineScaleMax = INCLINE_GRADE * 4;               // 7% → 25% height
+
+    // Secondary (right) axis: cumulative steps. Starts at 2000, grows by 1000
+    // once the count passes 75% of the current top.
+    let maxSteps = 0;
+    for (const s of sessionSamples) if (s && s.steps > maxSteps) maxSteps = s.steps;
+    let stepMax = 2000;
+    while (maxSteps > 0.75 * stepMax) stepMax += 1000;
+
     const xFor  = m => x0 + (m / windowMin) * plotW;
     const ySpd  = v => yBot - (Math.min(Math.max(v, 0), speedMax) / speedMax) * plotH;
     const yInc  = i => yBot - (Math.min(i, inclineScaleMax) / inclineScaleMax) * plotH;
+    const yStep = v => yBot - (Math.min(v, stepMax) / stepMax) * plotH;
 
     const frag = document.createDocumentFragment();
 
-    // axes
+    // axes (left = speed, right = steps)
     frag.appendChild(svgEl('line', { x1: x0, y1: yBot, x2: x1, y2: yBot }, 'chart-axis'));
     frag.appendChild(svgEl('line', { x1: x0, y1: yTop, x2: x0, y2: yBot }, 'chart-axis'));
+    frag.appendChild(svgEl('line', { x1: x1, y1: yTop, x2: x1, y2: yBot }, 'chart-axis'));
 
     // x gridlines + minute labels every 5 min
     for (let m = 0; m <= windowMin; m += 5) {
@@ -711,10 +728,17 @@ function renderChart() {
         t.textContent = String(m);
         frag.appendChild(t);
     }
-    // y labels: 0 / mid / max speed
+    // left y labels: 0 / mid / max speed
     for (const v of [0, speedMax / 2, speedMax]) {
         const t = svgEl('text', { x: x0 - 4, y: ySpd(v) + 3, 'text-anchor': 'end' }, 'chart-tick-text');
         t.textContent = (Number.isInteger(v) ? v : v.toFixed(1));
+        frag.appendChild(t);
+    }
+    // right y labels: 0 / mid / max steps (compact, e.g. 2k)
+    const stepLabel = v => v >= 1000 ? (v / 1000) + 'k' : String(v);
+    for (const v of [0, stepMax / 2, stepMax]) {
+        const t = svgEl('text', { x: x1 + 4, y: yStep(v) + 3, 'text-anchor': 'start' }, 'chart-tick-text');
+        t.textContent = stepLabel(v);
         frag.appendChild(t);
     }
 
@@ -743,6 +767,20 @@ function renderChart() {
     } else if (pts.length === 1) {
         const [cx, cy] = pts[0].split(',');
         frag.appendChild(svgEl('circle', { cx, cy, r: 3 }, 'chart-speed'));
+    }
+
+    // cumulative steps polyline on the right axis
+    const stepPts = [];
+    for (let m = 0; m <= lastMinute; m++) {
+        const s = sessionSamples[m];
+        if (!s || s.count === 0) continue;
+        stepPts.push(`${xFor(m + 0.5).toFixed(1)},${yStep(s.steps).toFixed(1)}`);
+    }
+    if (stepPts.length >= 2) {
+        frag.appendChild(svgEl('polyline', { points: stepPts.join(' ') }, 'chart-steps'));
+    } else if (stepPts.length === 1) {
+        const [cx, cy] = stepPts[0].split(',');
+        frag.appendChild(svgEl('circle', { cx, cy, r: 3 }, 'chart-steps'));
     }
 
     sessionChart.setAttribute('viewBox', `0 0 ${VB_W} ${VB_H}`);
