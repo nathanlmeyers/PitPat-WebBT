@@ -678,8 +678,11 @@ function svgEl(name, attrs, cls) {
  */
 function renderChart() {
     if (!sessionChart) return;
-    const VB_W = 320, VB_H = 160;
-    const x0 = 30, x1 = 314, yTop = 10, yBot = 140;
+    // Match the viewBox to the element's real pixel size (1 unit = 1 px) so
+    // text isn't stretched — preserveAspectRatio default keeps it 1:1.
+    const VB_H = 160;
+    const VB_W = Math.round(sessionChart.clientWidth) || 320;
+    const x0 = 30, x1 = VB_W - 6, yTop = 10, yBot = 140;
     const plotW = x1 - x0, plotH = yBot - yTop;
 
     const lastMinute = sessionSamples.length - 1;            // -1 if empty
@@ -702,7 +705,9 @@ function renderChart() {
     for (let m = 0; m <= windowMin; m += 5) {
         const x = xFor(m);
         if (m > 0) frag.appendChild(svgEl('line', { x1: x, y1: yTop, x2: x, y2: yBot }, 'chart-grid'));
-        const t = svgEl('text', { x, y: yBot + 11, 'text-anchor': 'middle' }, 'chart-tick-text');
+        // Keep the first/last labels from overflowing the plot edges.
+        const anchor = m === 0 ? 'start' : (m >= windowMin ? 'end' : 'middle');
+        const t = svgEl('text', { x, y: yBot + 11, 'text-anchor': anchor }, 'chart-tick-text');
         t.textContent = String(m);
         frag.appendChild(t);
     }
@@ -1159,6 +1164,9 @@ importHistoryInput.addEventListener('change', () => {
     const f = importHistoryInput.files?.[0];
     if (f) importHistory(f);
 });
+
+// Redraw the chart when the layout width changes (viewBox is width-derived).
+window.addEventListener('resize', renderChart);
 
 // Init
 updateSegmentedActive(unitToggle, unitMode);
