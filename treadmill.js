@@ -63,7 +63,8 @@ const BLE = {
     OFFSET_CALORIES:     18,
     OFFSET_DURATION_MS:  20,
     OFFSET_FLAGS:        26,
-    FLAG_UNIT_MPH:       0x80,   // treadmill's on-screen unit; speed value stays metric
+    FLAG_UNIT_MPH:       0x80,   // notification speed/distance are in THIS unit
+                                 // (the command-packet speed is always kph)
     FLAG_STATE_MASK:     0x18,
     FLAG_STATE_STARTING: 0x18,
     FLAG_STATE_RUNNING:  0x08,
@@ -355,11 +356,15 @@ function decodeNotification(value) {
         stateBits === BLE.FLAG_STATE_PAUSED   ? 2 : 3;
 
     return {
-        current_speed: u16(BLE.OFFSET_CURRENT_SPEED),  // kph × 1000
-        distance:      u32(BLE.OFFSET_DISTANCE),        // metres
+        // Notification speed/distance are in the treadmill's *display* unit
+        // (reported_unit) × 1000 — NOT metric. (The command packet's speed is
+        // the one that's always kph; the two paths differ.)
+        current_speed: u16(BLE.OFFSET_CURRENT_SPEED),  // reported_unit × 1000
+        distance:      u32(BLE.OFFSET_DISTANCE),        // reported_unit dist × 1000
         calories:      u16(BLE.OFFSET_CALORIES),
         steps:         u32(BLE.OFFSET_STEPS),
         duration:      Math.round(u32(BLE.OFFSET_DURATION_MS) / 1000),
+        reported_unit: (flags & BLE.FLAG_UNIT_MPH) ? 'mph' : 'kph',
         running_state,
     };
 }
@@ -392,6 +397,7 @@ function trackSession(raw) {
             steps: raw.steps, calories: raw.calories, distance: raw.distance,
             duration: raw.duration,
             speedSum: raw.current_speed, speedCount: 1,
+            reportedUnit: raw.reported_unit,  // fixed for the run
         };
         upsertLiveSession();
     } else if (running && sessionStartData) {
@@ -421,17 +427,22 @@ function sendQueuedOrHeartbeat() {
 function upsertLiveSession() {
     if (!sessionStartData) return;
     const s = sessionStartData;
-    // Stored canonically in metric (the treadmill's native units); the
-    // calendar/detail views convert to the user's chosen unit on render.
+    // The treadmill reports in its display unit; convert to canonical metric
+    // (km / kph) before storing so the calendar/detail views (which assume
+    // metric and re-convert per the user's choice) stay correct.
+    const repMph = s.reportedUnit === 'mph';
+    const distKm = repMph ? (s.distance / 1000) * KM_PER_MI : s.distance / 1000;
+    const avgRaw = (s.speedSum / s.speedCount) / 1000;
+    const avgKph = repMph ? avgRaw * KM_PER_MI : avgRaw;
     const session = {
         date: s.date,
         duration: s.duration,
         steps: s.steps,
         calories: adjustCalories(s.calories),
         rawCalories: s.calories,
-        distance: s.distance / 1000,           // km
+        distance: distKm,
         distanceUnit: 'km',
-        avgSpeed: (s.speedSum / s.speedCount) / 1000,  // kph
+        avgSpeed: avgKph,
         speedUnit: 'kph',
         inclineApplied: inclineMode,
     };
@@ -510,12 +521,19 @@ function setStatus(state) {
 }
 
 function buildDisplayFromRaw(raw) {
-    // The treadmill reports metric internally (speed = kph×1000, distance =
-    // metres) regardless of its on-screen unit; present in the user's unit.
+    // Notification values are in the treadmill's reported display unit; show
+    // them in the user's chosen unit (mph<->kph uses the same factor as
+    // mi<->km, so a single conversion serves both speed and distance).
+    const reported = raw.reported_unit;             // 'kph' | 'mph'
+    const speedVal = raw.current_speed / 1000;      // in reported unit
+    const speedUser = reported === unitMode
+        ? speedVal
+        : (reported === 'kph' ? speedVal / KM_PER_MI : speedVal * KM_PER_MI);
+    const fromDist = reported === 'mph' ? 'mi' : 'km';
     const userUnit = unitOfDistance();
     return {
-        speedDisplay:    kuToUser(raw.current_speed).toFixed(2) + ' ' + SPEED_RANGE[unitMode].label,
-        distanceDisplay: convertDistance(raw.distance / 1000, 'km', userUnit).toFixed(2) + ' ' + userUnit,
+        speedDisplay:    speedUser.toFixed(2) + ' ' + SPEED_RANGE[unitMode].label,
+        distanceDisplay: convertDistance(raw.distance / 1000, fromDist, userUnit).toFixed(2) + ' ' + userUnit,
         calories:        raw.calories,
         steps:           raw.steps,
         duration:        raw.duration,
