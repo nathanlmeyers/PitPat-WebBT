@@ -13,7 +13,7 @@
     <meta name="apple-mobile-web-app-title" content="PitPat">
     <meta name="mobile-web-app-capable" content="yes">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self'; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-ancestors 'none'">
-    <link rel="stylesheet" href="styles.css?v=20260515h">
+    <link rel="stylesheet" href="styles.css?v=20260515i">
 </head>
 <body>
     <div class="app">
@@ -37,6 +37,7 @@
 
                 <section class="chart-card">
                     <svg id="sessionChart" viewBox="0 0 320 160" role="img" aria-label="Session speed, steps, and incline by minute"></svg>
+                    <div id="chartDebug" class="chart-debug" hidden></div>
                 </section>
 
                 <div class="stats-grid">
@@ -59,6 +60,13 @@
                 </div>
 
                 <div class="settings">
+                    <div class="setting">
+                        <span class="setting-label">Units</span>
+                        <div class="segmented" id="unitToggleCtrl" data-role="unitToggle" role="group" aria-label="Units">
+                            <button class="seg is-active" data-value="kph" type="button" aria-pressed="true">KPH</button>
+                            <button class="seg" data-value="mph" type="button" aria-pressed="false">MPH</button>
+                        </div>
+                    </div>
                     <div class="setting">
                         <span class="setting-label">Incline</span>
                         <div class="segmented" id="inclineToggle" role="group" aria-label="Incline">
@@ -102,7 +110,7 @@
                     </div>
                 </div>
                 <div class="history-actions">
-                    <div class="segmented" id="unitToggle" role="group" aria-label="Units">
+                    <div class="segmented" id="unitToggle" data-role="unitToggle" role="group" aria-label="Units">
                         <button class="seg is-active" data-value="kph" type="button" aria-pressed="true">KPH</button>
                         <button class="seg" data-value="mph" type="button" aria-pressed="false">MPH</button>
                     </div>
@@ -177,6 +185,6 @@
             integrity="sha384-N5s9V3fxQzmwvcYVU2BIsnjPgkKEv7vmWgJ402BvM1N8LMhLT5dcX4cFwxWxpWu6"
             crossorigin="anonymous"
             referrerpolicy="no-referrer"></script>
-    <script type="module" src="treadmill.js?v=20260515h"></script>
+    <script type="module" src="treadmill.js?v=20260515i"></script>
 </body>
 </html>

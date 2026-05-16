@@ -146,8 +146,9 @@ const importHistoryBtn   = $('importHistoryBtn');
 const exportHistoryBtn   = $('exportHistoryBtn');
 const importHistoryInput = $('importHistoryInput');
 const toastEl            = $('toast');
-const unitToggle         = $('unitToggle');
+const unitToggles        = document.querySelectorAll('[data-role="unitToggle"]');
 const inclineToggle      = $('inclineToggle');
+const chartDebug         = $('chartDebug');
 const calGrid            = $('calGrid');
 const calMonth           = $('calMonth');
 const prevMonthBtn       = $('prevMonthBtn');
@@ -341,15 +342,16 @@ function adjustCalories(rawKcal) {
     return Math.round(inclineMode === INCLINE_GRADE ? n * INCLINE_KCAL_FACTOR : n);
 }
 
-/** Canonical metric from a decoded notification (fields are in reported_unit). */
-function rawKph(raw) {
-    const v = raw.current_speed / 1000;
-    return raw.reported_unit === 'mph' ? v * KM_PER_MI : v;
-}
-function rawKm(raw) {
-    const v = raw.distance / 1000;
-    return raw.reported_unit === 'mph' ? v * KM_PER_MI : v;
-}
+/**
+ * The treadmill reports speed/distance in METRIC (kph×1000, metres)
+ * regardless of the unit shown on its screen — `reported_unit` (the
+ * FLAG_UNIT_MPH bit) only reflects the on-screen label, not the value's
+ * unit. So canonicalizing is just /1000; everything downstream converts
+ * kph/km → the user's chosen unit. (A hardware screenshot showed speed
+ * reading ~1.6× high when we multiplied by KM_PER_MI here.)
+ */
+function rawKph(raw) { return raw.current_speed / 1000; }
+function rawKm(raw)  { return raw.distance / 1000; }
 
 /**
  * ACSM walking metabolic equation. The treadmill caps ~3.8 mph, so walking
@@ -428,6 +430,7 @@ function onDisconnected() {
     connected = false;
     connectBtn.textContent = 'Connect';
     updateRunningState(3); // also sets status to disconnected when !connected
+    if (chartDebug) chartDebug.hidden = true;
     if (sessionActive) finishSession();
 }
 
@@ -474,7 +477,20 @@ function handleNotification(event) {
     updateDashboard(buildDisplayFromRaw(raw));
     updateRunningState(raw.running_state);
     trackSession(raw);
+    updateDebug(raw);
     sendQueuedOrHeartbeat();
+}
+
+/** TEMPORARY diagnostic line under the chart — confirms exactly what the
+ *  treadmill sends so we can finalize the unit/duration handling, then
+ *  remove this. Visible only while connected. */
+function updateDebug(raw) {
+    if (!chartDebug) return;
+    const sess = sessionStartData ? raw.duration - sessionStartData.startDuration : 0;
+    chartDebug.textContent =
+        `debug cs=${raw.current_speed} dist=${raw.distance} u=${raw.reported_unit} ` +
+        `durRaw=${raw.duration}s durSess=${sess}s`;
+    chartDebug.hidden = !connected;
 }
 
 /** Record the minute slot for the chart. We store the LAST sample of each
@@ -483,7 +499,8 @@ function handleNotification(event) {
  *  reading whenever the speed had been changed within the minute. Speed is
  *  kept in canonical kph so a mid-session unit toggle re-scales correctly. */
 function recordSample(raw) {
-    const minute = Math.max(0, Math.floor(raw.duration / 60));
+    const base = sessionStartData ? sessionStartData.startDuration : raw.duration;
+    const minute = Math.max(0, Math.floor((raw.duration - base) / 60));
     const slot = sessionSamples[minute] ||
         (sessionSamples[minute] = { kph: 0, incline: inclineMode, steps: 0 });
     slot.kph = rawKph(raw);
@@ -499,8 +516,11 @@ function trackSession(raw) {
             date: Date.now(),
             steps: raw.steps, calories: raw.calories, distance: raw.distance,
             duration: raw.duration, prevDuration: raw.duration,
+            // Immutable baseline: the treadmill's duration counter is
+            // cumulative (not reset per session), so the chart/Duration use
+            // elapsed = raw.duration - startDuration. Never reassigned.
+            startDuration: raw.duration,
             speedSum: raw.current_speed, speedCount: 1,
-            reportedUnit: raw.reported_unit,  // fixed for the run
         };
         estKcal = 0;
         estSteps = 0;
@@ -545,13 +565,10 @@ function sendQueuedOrHeartbeat() {
 function upsertLiveSession() {
     if (!sessionStartData) return;
     const s = sessionStartData;
-    // The treadmill reports in its display unit; convert to canonical metric
-    // (km / kph) before storing so the calendar/detail views (which assume
-    // metric and re-convert per the user's choice) stay correct.
-    const repMph = s.reportedUnit === 'mph';
-    const distKm = repMph ? (s.distance / 1000) * KM_PER_MI : s.distance / 1000;
-    const avgRaw = (s.speedSum / s.speedCount) / 1000;
-    const avgKph = repMph ? avgRaw * KM_PER_MI : avgRaw;
+    // Notification fields are already metric (m / kph×1000); store canonical
+    // km / kph so the calendar/detail views convert per the user's choice.
+    const distKm = s.distance / 1000;
+    const avgKph = (s.speedSum / s.speedCount) / 1000;
     // Use the profile-based estimates when available so stored history matches
     // the live dashboard; otherwise the firmware numbers (incline-adjusted).
     const calories = profile.weightKg != null
@@ -645,15 +662,18 @@ function setStatus(state) {
 }
 
 function buildDisplayFromRaw(raw) {
-    // Notification fields are in the treadmill's reported unit; rawKph/rawKm
-    // canonicalize, then we present in the user's chosen unit. Calories/steps
-    // use the profile estimate when set, else the firmware value.
+    // rawKph/rawKm canonicalize (metric); present in the user's chosen unit.
+    // Calories/steps use the profile estimate when set, else firmware.
+    // Duration is session-relative (treadmill's counter is cumulative).
     const userUnit = unitOfDistance();
+    const sessionSecs = sessionStartData
+        ? raw.duration - sessionStartData.startDuration
+        : raw.duration;
     return {
         distanceDisplay: convertDistance(rawKm(raw), 'km', userUnit).toFixed(2) + ' ' + userUnit,
         calories: profile.weightKg != null ? Math.round(estKcal) : adjustCalories(raw.calories),
         steps:    profile.heightCm != null ? Math.round(estSteps) : raw.steps,
-        duration: raw.duration,
+        duration: Math.max(0, sessionSecs),
     };
 }
 
@@ -833,12 +853,17 @@ function setTargetSpeed(userValue) {
     renderPresets();
 }
 
+/** Keep every unit toggle (Controls + History) in sync with unitMode. */
+function syncUnitToggles() {
+    unitToggles.forEach(g => updateSegmentedActive(g, unitMode));
+}
+
 function setUnit(newUnit) {
     if (newUnit !== 'kph' && newUnit !== 'mph') return;
     if (newUnit === unitMode) return;
     unitMode = newUnit;
     localStorage.setItem(PREF_UNIT, unitMode);
-    updateSegmentedActive(unitToggle, unitMode);
+    syncUnitToggles();
     // curTargetSpeed is in native units (unit-independent); only the
     // slider/readout presentation changes — the physical target is unchanged,
     // so there's no need to resend a command.
@@ -1209,7 +1234,7 @@ speedSlider.addEventListener('change', () => {
 });
 
 // Segmented toggles
-wireSegmented(unitToggle,    setUnit);
+unitToggles.forEach(g => wireSegmented(g, setUnit));
 wireSegmented(inclineToggle, setIncline);
 
 // Settings modal
@@ -1243,7 +1268,7 @@ importHistoryInput.addEventListener('change', () => {
 window.addEventListener('resize', renderChart);
 
 // Init
-updateSegmentedActive(unitToggle, unitMode);
+syncUnitToggles();
 updateSegmentedActive(inclineToggle, String(inclineMode));
 applyTileVisibility();
 applyUnitToSlider();   // also renders presets

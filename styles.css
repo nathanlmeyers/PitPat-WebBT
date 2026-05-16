@@ -202,7 +202,7 @@ button { font-family: inherit; }
 
 .settings {
     display: grid;
-    grid-template-columns: 1fr;
+    grid-template-columns: 1fr 1fr;
     gap: 10px;
     margin-bottom: 16px;
 }
@@ -541,6 +541,14 @@ input[type="range"]:disabled { opacity: 0.5; cursor: not-allowed; }
     width: 100%;
     height: 160px;
 }
+.chart-debug {
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+    word-break: break-all;
+}
+.chart-debug[hidden] { display: none; }
 .chart-axis      { stroke: var(--border); stroke-width: 1; }
 .chart-grid      { stroke: var(--border); stroke-width: 1; opacity: 0.5; }
 .chart-tick-text { fill: var(--text-muted); font-size: 9px; }
