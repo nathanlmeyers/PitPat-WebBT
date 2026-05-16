@@ -884,8 +884,8 @@ function aggregateByDay(sessions) {
     return map;
 }
 
-/** All-time totals across stored sessions: distance (user's unit), elevation
- *  climbed (m/ft from each session's incline × distance), and steps. */
+/** All-time totals across stored sessions: distance (user's unit), vertical
+ *  feet climbed (Σ session distance × incline grade), and steps. */
 function renderLifetime() {
     let dist = 0, steps = 0, climbM = 0;
     for (const s of loadSessions()) {
@@ -900,9 +900,8 @@ function renderLifetime() {
     }
     lifeDistance.textContent = dist.toFixed(2) + ' ' + unitOfDistance();
     lifeSteps.textContent = Math.round(steps).toLocaleString();
-    lifeClimb.textContent = unitOfDistance() === 'mi'
-        ? Math.round(climbM * FT_PER_M).toLocaleString() + ' ft'
-        : Math.round(climbM).toLocaleString() + ' m';
+    // Vertical elevation gained on the 7% grade — always feet.
+    lifeClimb.textContent = Math.round(climbM * FT_PER_M).toLocaleString() + ' ft';
 }
 
 function renderCalendar() {
