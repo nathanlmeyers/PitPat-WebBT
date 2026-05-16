@@ -202,7 +202,7 @@ button { font-family: inherit; }
 
 .settings {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: 1fr;
     gap: 10px;
     margin-bottom: 16px;
 }
@@ -323,9 +323,14 @@ input[type="range"]:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .history-actions {
     display: flex;
-    justify-content: flex-end;
+    align-items: center;
+    justify-content: space-between;
     gap: 8px;
     margin-bottom: 14px;
+}
+.history-buttons {
+    display: flex;
+    gap: 8px;
 }
 .calendar {
     background: var(--surface);
@@ -626,7 +631,7 @@ polyline.chart-steps { fill: none; }
 /* Lifetime totals (History tab) */
 .lifetime {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(3, 1fr);
     gap: 10px;
     margin-bottom: 14px;
 }
@@ -658,4 +663,7 @@ polyline.chart-steps { fill: none; }
     .cal-day-totals { font-size: 10px; }
     #sessionChart { height: 140px; }
     .preset-btn { font-size: 12px; padding: 7px 0; }
+    .lifetime { gap: 6px; }
+    .lifetime-item { padding: 10px 8px; }
+    .lifetime-value { font-size: 16px; }
 }

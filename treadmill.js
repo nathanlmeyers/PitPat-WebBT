@@ -107,6 +107,7 @@ const INCLINE_KCAL_FACTOR = 1.80;
 const KM_PER_MI = 1.609344;
 const LB_PER_KG = 2.20462;
 const CM_PER_IN = 2.54;
+const FT_PER_M  = 3.28084;
 const STRIDE_FACTOR = 0.414;   // walking stride ≈ 0.414 × height (unisex)
 
 // PitPat protocol default user ID — a protocol constant, NOT a personal
@@ -169,6 +170,7 @@ const tileChecks = {
 const sessionChart       = $('sessionChart');
 const presetRow          = $('presetRow');
 const lifeDistance       = $('lifeDistance');
+const lifeClimb          = $('lifeClimb');
 const lifeSteps          = $('lifeSteps');
 const tabs   = document.querySelectorAll('.tab');
 const panels = { controls: $('controls-panel'), history: $('history-panel') };
@@ -882,17 +884,25 @@ function aggregateByDay(sessions) {
     return map;
 }
 
-/** All-time totals across stored sessions: distance (user's unit) + steps. */
+/** All-time totals across stored sessions: distance (user's unit), elevation
+ *  climbed (m/ft from each session's incline × distance), and steps. */
 function renderLifetime() {
-    let dist = 0, steps = 0;
+    let dist = 0, steps = 0, climbM = 0;
     for (const s of loadSessions()) {
         const n = normalizeSession(s);
         if (!n) continue;
         dist += n.distance;
         steps += Number(s.steps) || 0;
+        const from = s.distanceUnit || (s.speedUnit === 'mph' ? 'mi' : 'km');
+        const km = convertDistance(Number(s.distance) || 0, from, 'km');
+        const grade = (Number(s.inclineApplied) === INCLINE_GRADE ? INCLINE_GRADE : 0) / 100;
+        climbM += km * 1000 * grade;
     }
     lifeDistance.textContent = dist.toFixed(2) + ' ' + unitOfDistance();
     lifeSteps.textContent = Math.round(steps).toLocaleString();
+    lifeClimb.textContent = unitOfDistance() === 'mi'
+        ? Math.round(climbM * FT_PER_M).toLocaleString() + ' ft'
+        : Math.round(climbM).toLocaleString() + ' m';
 }
 
 function renderCalendar() {
