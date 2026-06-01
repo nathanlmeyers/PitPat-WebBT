@@ -13,7 +13,7 @@
     <meta name="apple-mobile-web-app-title" content="PitPat">
     <meta name="mobile-web-app-capable" content="yes">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self'; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-ancestors 'none'">
-    <link rel="stylesheet" href="styles.css?v=20260515j">
+    <link rel="stylesheet" href="styles.css?v=20260515k">
 </head>
 <body>
     <div class="app">
@@ -81,16 +81,18 @@
                         <span class="slider-label">Target speed</span>
                         <span class="slider-value"><span id="sliderValue">1.0</span><span id="sliderUnit"> kph</span></span>
                     </div>
-                    <input type="range" id="speedSlider" min="1" max="6" step="0.1" value="1">
+                    <div class="slider-bumps">
+                        <button id="speedDownBtn" class="btn btn-bump" disabled aria-label="Speed down">−</button>
+                        <input type="range" id="speedSlider" min="1" max="6" step="0.1" value="1">
+                        <button id="speedUpBtn" class="btn btn-bump" disabled aria-label="Speed up">+</button>
+                    </div>
                 </div>
 
                 <div class="preset-row" id="presetRow" aria-label="Speed presets"></div>
 
                 <div class="controls">
-                    <button id="speedDownBtn" class="btn btn-bump" disabled aria-label="Speed down">−</button>
                     <button id="startBtn" class="btn btn-go" disabled>Start</button>
                     <button id="stopBtn" class="btn btn-stop" disabled>Stop</button>
-                    <button id="speedUpBtn" class="btn btn-bump" disabled aria-label="Speed up">+</button>
                 </div>
             </section>
 
@@ -185,6 +187,6 @@
             integrity="sha384-N5s9V3fxQzmwvcYVU2BIsnjPgkKEv7vmWgJ402BvM1N8LMhLT5dcX4cFwxWxpWu6"
             crossorigin="anonymous"
             referrerpolicy="no-referrer"></script>
-    <script type="module" src="treadmill.js?v=20260515j"></script>
+    <script type="module" src="treadmill.js?v=20260515k"></script>
 </body>
 </html>

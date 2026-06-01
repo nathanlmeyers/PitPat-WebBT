@@ -314,19 +314,28 @@ input[type="range"]:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .controls {
     display: grid;
-    grid-template-columns: auto 1fr 1fr auto;
+    grid-template-columns: 1fr 1fr;
     gap: 8px;
 }
 .controls .btn { padding: 12px 14px; font-weight: 600; }
+
+/* Bump buttons flank the slider on either side */
+.slider-bumps {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.slider-bumps input[type="range"] { flex: 1; min-width: 0; }
 .btn-bump {
     background: var(--accent);
     border-color: var(--accent);
     color: var(--accent-text);
     font-size: 22px;
     font-weight: 700;
-    min-width: 56px;
-    padding: 12px 18px;
+    min-width: 48px;
+    padding: 8px 14px;
     line-height: 1;
+    flex: 0 0 auto;
 }
 .btn-bump:hover:not(:disabled) { filter: brightness(1.05); border-color: var(--accent); }
 
