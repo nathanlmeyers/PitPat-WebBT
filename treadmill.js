@@ -1233,6 +1233,48 @@ speedSlider.addEventListener('change', () => {
     if (connected) pendingCommand = makePacket('set_speed', curTargetSpeed);
 });
 
+// Keyboard control: ←/→ adjust speed, ↓ toggles pause/resume.
+// OS key-repeat fires keydown rapidly while held, so rate-limit each action.
+const KEY_THROTTLE_MS = { speed: 150, toggle: 600 };
+const lastKeyTime = { speed: 0, toggle: 0 };
+function keyAllowed(kind) {
+    const now = performance.now();
+    if (now - lastKeyTime[kind] < KEY_THROTTLE_MS[kind]) return false;
+    lastKeyTime[kind] = now;
+    return true;
+}
+
+window.addEventListener('keydown', e => {
+    // Let native controls (slider, settings inputs) handle their own keys.
+    const tag = document.activeElement?.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    if (!settingsModal.hidden) return;
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
+
+    switch (e.key) {
+        case 'ArrowRight':
+            e.preventDefault();
+            if (keyAllowed('speed')) bumpSpeed(+0.1);
+            break;
+        case 'ArrowLeft':
+            e.preventDefault();
+            if (keyAllowed('speed')) bumpSpeed(-0.1);
+            break;
+        case 'ArrowDown':
+            e.preventDefault();
+            // Only toggle while a session is active (running or paused).
+            if (!connected || (runningState !== 1 && runningState !== 2)) break;
+            if (!keyAllowed('toggle')) break;
+            if (runningState === 1) {
+                pendingCommand = makePacket('pause');
+            } else {
+                showCountdown();
+                pendingCommand = makePacket('start', curTargetSpeed);
+            }
+            break;
+    }
+});
+
 // Segmented toggles
 unitToggles.forEach(g => wireSegmented(g, setUnit));
 wireSegmented(inclineToggle, setIncline);
