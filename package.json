@@ -1,0 +1,11 @@
+{
+  "name": "pitpat-treadmill-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Web Bluetooth dashboard for the PitPat treadmill.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "serve": "python3 -m http.server 8000"
+  }
+}
