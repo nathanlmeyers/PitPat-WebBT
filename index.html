@@ -12,35 +12,40 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-title" content="PitPat">
     <meta name="mobile-web-app-capable" content="yes">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self'; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-ancestors 'none'">
-    <link rel="stylesheet" href="styles.css?v=20260515k">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-ancestors 'none'">
+    <link rel="stylesheet" href="styles.css">
 </head>
 <body>
     <div class="app">
         <header class="app-header">
             <h1>PitPat</h1>
-            <nav class="tabs">
-                <button class="tab is-active" data-tab="controls">Controls</button>
-                <button class="tab" data-tab="history">History</button>
+            <nav class="tabs" role="tablist" aria-label="Views">
+                <button class="tab is-active" data-tab="controls" role="tab" aria-selected="true" aria-controls="controls-panel">Controls</button>
+                <button class="tab" data-tab="history" role="tab" aria-selected="false" aria-controls="history-panel">History</button>
             </nav>
         </header>
 
         <main>
-            <section id="controls-panel" class="panel is-active">
+            <section id="controls-panel" class="panel is-active" role="tabpanel" aria-label="Controls">
                 <div class="status-row">
-                    <span id="statusChip" class="chip chip-disconnected">Disconnected</span>
+                    <span id="statusChip" class="chip chip-disconnected" role="status" aria-live="polite">Disconnected</span>
                     <div class="status-actions">
                         <button id="settingsBtn" class="icon-btn" aria-label="Settings">⚙</button>
                         <button id="connectBtn" class="btn btn-primary">Connect</button>
                     </div>
                 </div>
 
+                <p id="unsupportedNotice" class="notice" hidden>
+                    This browser doesn't support Web Bluetooth, so it can't talk to the
+                    treadmill. Your history is still here, and Chrome, Edge, or Brave will
+                    connect.
+                </p>
+
                 <section class="chart-card">
                     <svg id="sessionChart" viewBox="0 0 320 160" role="img" aria-label="Session speed, steps, and incline by minute"></svg>
-                    <div id="chartDebug" class="chart-debug" hidden></div>
                 </section>
 
-                <div class="stats-grid">
+                <div class="stats-grid" role="group" aria-label="Session totals">
                     <div class="stat" data-tile="distance">
                         <div class="stat-label">Distance</div>
                         <div class="stat-value" id="distance">—</div>
@@ -83,7 +88,8 @@
                     </div>
                     <div class="slider-bumps">
                         <button id="speedDownBtn" class="btn btn-bump" disabled aria-label="Speed down">−</button>
-                        <input type="range" id="speedSlider" min="1" max="6" step="0.1" value="1">
+                        <input type="range" id="speedSlider" min="1" max="6" step="0.1" value="1"
+                               aria-label="Target speed" aria-valuetext="1.0 kph">
                         <button id="speedUpBtn" class="btn btn-bump" disabled aria-label="Speed up">+</button>
                     </div>
                 </div>
@@ -96,7 +102,7 @@
                 </div>
             </section>
 
-            <section id="history-panel" class="panel">
+            <section id="history-panel" class="panel" role="tabpanel" aria-label="History">
                 <div class="lifetime">
                     <div class="lifetime-item">
                         <div class="lifetime-label">Total distance</div>
@@ -181,12 +187,8 @@
             </div>
         </div>
     </div>
-    <div id="toast" class="toast" hidden></div>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
-    <script src="https://cdn.jsdelivr.net/npm/date-fns@4.1.0/cdn.min.js"
-            integrity="sha384-N5s9V3fxQzmwvcYVU2BIsnjPgkKEv7vmWgJ402BvM1N8LMhLT5dcX4cFwxWxpWu6"
-            crossorigin="anonymous"
-            referrerpolicy="no-referrer"></script>
-    <script type="module" src="treadmill.js?v=20260515k"></script>
+    <script type="module" src="treadmill.js"></script>
 </body>
 </html>

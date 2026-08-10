@@ -1,128 +1,67 @@
 // =============================================================================
 // PitPat Treadmill Web Dashboard
 //
-// Single-file ES module that drives the dashboard for a PitPat treadmill over
-// Web Bluetooth. Loaded as `<script type="module">` from index.html. Uses the
-// date-fns CDN global (window.dateFns) for calendar math; no other deps.
+// Loaded as `<script type="module">` from index.html. This file is the shell:
+// DOM refs, mutable app state, and event wiring. The logic worth testing lives
+// in ./lib as pure modules:
+//
+//   lib/protocol.js  — BLE UUIDs, notification decoding, command frames
+//   lib/units.js     — conversions, slider ranges, ACSM / stride math
+//   lib/sessions.js  — session sanitizing, merging, aggregation
+//   lib/dates.js     — the slice of date-fns the calendar needed
 //
 // Sections in this file:
-//   1.  Constants     — BLE protocol, app config, units, persistence keys
-//   2.  DOM refs      — cached element handles
-//   3.  State         — mutable runtime state
-//   4.  Storage       — localStorage helpers for sessions + sanitization
-//   5.  Helpers       — formatting, conversion, incline adjustment
-//   6.  Bluetooth     — connect / disconnect / notification handler
-//   7.  Packet builder
-//   8.  Display       — dashboard, slider, segmented toggles, status chip
-//   9.  History       — calendar, day detail, import/export
+//   1.  Config & DOM refs
+//   2.  State
+//   3.  Storage
+//   4.  Unit-bound wrappers
+//   5.  Bluetooth (connect, reconnect, notifications)
+//   6.  Session tracking
+//   7.  Display (dashboard, chart, slider, status)
+//   8.  History (calendar, day detail, import/export)
+//   9.  Wake lock
 //  10.  Wiring & init
-//
-// Session storage shape (under `treadmill_sessions` in localStorage). New
-// sessions are written canonically in metric (km / kph); the unit fields are
-// kept so older or imported records in mi/mph still convert correctly on
-// render via normalizeSession().
-//   { date: number,              // ms timestamp
-//     duration: number,          // seconds
-//     steps: number,
-//     calories: number,          // already incline-adjusted at save time
-//     rawCalories: number,       // firmware-reported, reference only
-//     distance: number,          // in `distanceUnit`
-//     distanceUnit: 'km'|'mi',   // new sessions: 'km'
-//     avgSpeed: number,          // in `speedUnit`
-//     speedUnit: 'kph'|'mph',    // new sessions: 'kph'
-//     inclineApplied: 0|7 }
 // =============================================================================
 
+import {
+    SERVICE_UUID, NOTIFY_CHAR_UUID, WRITE_CHAR_UUID,
+    STATE, HEARTBEAT, decodeNotification, makePacket,
+} from './lib/protocol.js';
 
-// ---- 1. Constants ----------------------------------------------------------
+import {
+    KM_PER_MI, LB_PER_KG, CM_PER_IN, FT_PER_M,
+    INCLINE_GRADE, SPEED_RANGE,
+    unitOfDistance as unitOfDistanceFor,
+    convertDistance, userToKU as userToKUFor, kuToUser as kuToUserFor,
+    formatDuration, adjustCalories as adjustCaloriesFor,
+    estimateKcalPerMin, strideMeters,
+} from './lib/units.js';
 
-const SERVICE_UUID     = "0000fba0-0000-1000-8000-00805f9b34fb";
-const NOTIFY_CHAR_UUID = "0000fba2-0000-1000-8000-00805f9b34fb";
-const WRITE_CHAR_UUID  = "0000fba1-0000-1000-8000-00805f9b34fb";
+import {
+    normalizeSession as normalizeSessionFor, mergeSessions,
+    isJunkSession, aggregateByDay, lifetimeTotals,
+} from './lib/sessions.js';
 
-/**
- * PitPat BLE protocol layout.
- *
- * Notification payload (≥ MIN_PACKET_LEN bytes): treadmill → app at ~1 Hz.
- *   bytes 3..4   u16  current speed × 1000 (in current unit)
- *   bytes 7..10  u32  distance × 1000      (in current unit)
- *   bytes 14..17 u32  steps
- *   bytes 18..19 u16  calories (kcal)
- *   bytes 20..23 u32  duration (ms)
- *   byte  26          flags (bit 7 = mph; bits 3-4 encode run state)
- *
- * Command packet (23 bytes): app → treadmill, framed by START_BYTE/END_BYTE
- * with an XOR checksum at byte 21. See `makePacket` for full layout.
- */
-const BLE = {
-    MIN_PACKET_LEN:      31,
-    // notification payload
-    OFFSET_CURRENT_SPEED: 3,
-    OFFSET_DISTANCE:      7,
-    OFFSET_STEPS:        14,
-    OFFSET_CALORIES:     18,
-    OFFSET_DURATION_MS:  20,
-    OFFSET_FLAGS:        26,
-    FLAG_UNIT_MPH:       0x80,   // notification speed/distance are in THIS unit
-                                 // (the command-packet speed is always kph)
-    FLAG_STATE_MASK:     0x18,
-    FLAG_STATE_STARTING: 0x18,
-    FLAG_STATE_RUNNING:  0x08,
-    FLAG_STATE_PAUSED:   0x10,
-    // command packet
-    START_BYTE:          0x6A,
-    END_BYTE:            0x43,
-    CMD_UNIT_MPH_BIT:    0x08,   // OR into byte 12 when speaking mph
-    CMD_KPH_MASK:        0xF7,   // AND into byte 12 to force kph
-};
+import {
+    format, startOfMonth, endOfMonth, eachDayOfInterval, addMonths,
+    dayKey, startOfThisMonth,
+} from './lib/dates.js';
 
-/** Speed slider ranges, expressed in the user's selected display unit. */
-const SPEED_RANGE = {
-    kph: { min: 1.0, max: 6.0, label: 'kph' },
-    mph: { min: 0.7, max: 3.8, label: 'mph' },
-};
 
-/**
- * The treadmill's speed command is ALWAYS kph × 1000 internally, no matter
- * which unit its screen shows — the unit bit in the command byte only changes
- * the on-screen label, not how the speed value is interpreted. So we keep the
- * target in those native units and convert to/from the user's unit purely for
- * the slider and the readout. (Sending "3.7" while meaning 3.7 mph made the
- * belt run at 3.7 kph ≈ 2.3 mph — the original calibration bug.)
- */
-const KU_MIN = 1000;   // 1.0 kph
-const KU_MAX = 6200;   // ~6.2 kph ≈ 3.85 mph — covers the Deerrun's 3.8 mph cap
+// ---- 1. Config & DOM refs -------------------------------------------------
 
 const PREF_UNIT    = 'treadmill_unit';
 const PREF_INCLINE = 'treadmill_incline';
 const SESSIONS_KEY = 'treadmill_sessions';
 const PROFILE_KEY  = 'treadmill_profile';
 
-const INCLINE_GRADE = 7;   // the treadmill's manual incline switch, in percent
-// Fallback used ONLY when the user hasn't entered body metrics: firmware
-// doesn't fold the incline switch into its kcal count, so apply a flat ~1.8×
-// at 7% (ACSM walking eq, ~2.5–3 mph). Once a weight is set we integrate the
-// real ACSM equation instead (incline folded in) — see estimateKcalPerMin.
-const INCLINE_KCAL_FACTOR = 1.80;
-const KM_PER_MI = 1.609344;
-const LB_PER_KG = 2.20462;
-const CM_PER_IN = 2.54;
-const FT_PER_M  = 3.28084;
-const STRIDE_FACTOR = 0.414;   // walking stride ≈ 0.414 × height (unisex)
+/** How often the in-progress session is written to localStorage. The dashboard
+ *  still updates every notification (~1 Hz) from in-memory state; only the
+ *  persist + calendar rebuild are throttled, since both are O(history). */
+const PERSIST_INTERVAL_MS = 10_000;
 
-// PitPat protocol default user ID — a protocol constant, NOT a personal
-// identifier. Every command packet carries the same bytes here.
-const USER_ID_BYTES = (() => {
-    const id = 58965456623n;
-    const out = new Uint8Array(8);
-    for (let i = 0; i < 8; ++i) out[i] = Number((id >> BigInt(56 - i * 8)) & 0xFFn);
-    return out;
-})();
-
-const HEARTBEAT = new Uint8Array([0x6a, 0x05, 0xfd, 0xf8, 0x43]);
-
-
-// ---- 2. DOM refs ----------------------------------------------------------
+/** Backoff schedule for reconnecting after an unexpected BLE drop (~30s). */
+const RECONNECT_DELAYS_MS = [500, 1000, 2000, 4000, 8000, 15000];
 
 const $ = id => document.getElementById(id);
 
@@ -139,6 +78,7 @@ const speedSlider        = $('speedSlider');
 const sliderValue        = $('sliderValue');
 const sliderUnit         = $('sliderUnit');
 const statusChip         = $('statusChip');
+const unsupportedNotice  = $('unsupportedNotice');
 const loadingOverlay     = $('loadingOverlay');
 const countdownOverlay   = $('countdownOverlay');
 const countdownNumber    = $('countdownNumber');
@@ -148,7 +88,6 @@ const importHistoryInput = $('importHistoryInput');
 const toastEl            = $('toast');
 const unitToggles        = document.querySelectorAll('[data-role="unitToggle"]');
 const inclineToggle      = $('inclineToggle');
-const chartDebug         = $('chartDebug');
 const calGrid            = $('calGrid');
 const calMonth           = $('calMonth');
 const prevMonthBtn       = $('prevMonthBtn');
@@ -177,36 +116,60 @@ const tabs   = document.querySelectorAll('.tab');
 const panels = { controls: $('controls-panel'), history: $('history-panel') };
 
 
-// ---- 3. State -------------------------------------------------------------
+// ---- 2. State -------------------------------------------------------------
 
 let unitMode    = localStorage.getItem(PREF_UNIT)    === 'mph' ? 'mph' : 'kph';
 let inclineMode = localStorage.getItem(PREF_INCLINE) === String(INCLINE_GRADE) ? INCLINE_GRADE : 0;
 
 let device = null, server = null, notifyChar = null, writeChar = null;
 let connected = false;
-let runningState = 3;       // 0 Starting · 1 Running · 2 Paused · 3 Stopped
+let runningState = STATE.STOPPED;
 let curTargetSpeed = 1000;  // treadmill speed command — kph × 1000 (unit-independent)
 
-let lastRaw = null;         // most recent decoded notification (for re-render)
 let pendingCommand = null;  // queued packet, sent on next notification tick
 
-let sessionActive = false;
-let sessionStartData = null;
+let userDisconnect = false; // true while a disconnect the user asked for is in flight
+let reconnectTimer = null;
+
+/**
+ * The in-progress session, or null.
+ *
+ * `baseline` is captured at the first running notification and never changes;
+ * `latest` is overwritten every tick. All session totals are latest − baseline.
+ * The treadmill's duration counter is cumulative across runs, and the other
+ * counters may be too — subtracting a baseline is correct either way, and
+ * clamping at zero covers the case where the firmware resets a counter
+ * mid-session. (Previously only duration was baselined, while distance / steps
+ * / calories were stored raw under start-sounding names.)
+ *
+ * @type {{ date: number,
+ *          baseline: {duration:number, distance:number, steps:number, calories:number},
+ *          latest:   {duration:number, distance:number, steps:number, calories:number},
+ *          prevDuration: number, speedSum: number, speedCount: number,
+ *          estKcal: number, estSteps: number,
+ *          samples: Array<{kph:number, incline:number, steps:number}> } | null}
+ */
+let session = null;
+
+/** The most recent completed session, kept so the dashboard keeps showing its
+ *  totals after Stop instead of falling back to the treadmill's cumulative
+ *  lifetime counters. */
+let lastFinished = null;
+
+let lastPersistAt = 0;
+let historyDirty = false;
+
 let calViewDate = startOfThisMonth();
 let selectedDayKey = null;
 
 let profile = loadProfile();
-
-// Per-minute samples for the current session's chart: index = minute,
-// value = { sum, count, incline }. Reset on each new session.
-let sessionSamples = [];
-let estKcal = 0;            // ACSM-integrated kcal for the active session
-let estSteps = 0;           // speed-integrated step count (smooth, profile-based)
-
+let wakeLock = null;
 let toastTimer = null;
 
+const bluetoothSupported = typeof navigator !== 'undefined' && !!navigator.bluetooth;
 
-// ---- 4. Storage -----------------------------------------------------------
+
+// ---- 3. Storage -----------------------------------------------------------
 
 function loadSessions() {
     try {
@@ -215,14 +178,28 @@ function loadSessions() {
     } catch { return []; }
 }
 
+/** @returns {boolean} whether the write actually landed — callers must not
+ *  report success without checking. */
 function saveSessions(sessions) {
-    localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions));
+    try {
+        localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions));
+        return true;
+    } catch (err) {
+        // Quota exceeded or storage disabled — don't take the session down with it.
+        console.error('Could not save sessions:', err);
+        showToast('Could not save history (storage full?)');
+        return false;
+    }
 }
 
 function deleteSessionByDate(dateTs) {
     saveSessions(loadSessions().filter(s => s.date !== dateTs));
-    renderCalendar();
-    if (selectedDayKey) renderDayDetail(selectedDayKey);
+    if (lastFinished?.date === dateTs) {
+        // Don't leave the dashboard showing totals the user just deleted.
+        lastFinished = null;
+        updateDashboard();
+    }
+    flushHistoryRender();
 }
 
 /**
@@ -249,148 +226,36 @@ function loadProfile() {
         },
     };
 }
+
 function saveProfile(p) {
     profile = p;
     localStorage.setItem(PROFILE_KEY, JSON.stringify(p));
 }
 
-/**
- * Coerce an untrusted object into a canonical session, or return null if it's
- * not recognizable as one. Used by Import to defend localStorage from junk;
- * the renderers stay defensive but data is sanitized here so they don't have
- * to spread that responsibility.
- */
-function cleanSession(raw) {
-    if (!raw || typeof raw !== 'object') return null;
-    if (typeof raw.date !== 'number' || !Number.isFinite(raw.date)) return null;
 
-    const num = (x, def = 0) => {
-        const n = Number(typeof x === 'string' ? parseFloat(x) : x);
-        return Number.isFinite(n) ? n : def;
-    };
-    const speedUnit = raw.speedUnit === 'mph' ? 'mph' : 'kph';
-    const distanceUnit =
-        raw.distanceUnit === 'mi' ? 'mi' :
-        raw.distanceUnit === 'km' ? 'km' :
-        (speedUnit === 'mph' ? 'mi' : 'km');
+// ---- 4. Unit-bound wrappers -----------------------------------------------
+// The lib functions are pure and take the unit explicitly; these bind the
+// current `unitMode` so call sites stay readable.
 
-    return {
-        date:           raw.date,
-        duration:       Math.max(0, Math.floor(num(raw.duration))),
-        steps:          Math.max(0, Math.floor(num(raw.steps))),
-        calories:       Math.max(0, Math.round(num(raw.calories))),
-        rawCalories:    Math.max(0, Math.round(num(raw.rawCalories ?? raw.calories))),
-        distance:       Math.max(0, num(raw.distance)),
-        distanceUnit,
-        avgSpeed:       Math.max(0, num(raw.avgSpeed)),
-        speedUnit,
-        inclineApplied: raw.inclineApplied === INCLINE_GRADE ? INCLINE_GRADE : 0,
-    };
-}
+const unitOfDistance   = ()    => unitOfDistanceFor(unitMode);
+const userToKU         = v     => userToKUFor(v, unitMode);
+const kuToUser         = ku    => kuToUserFor(ku, unitMode);
+const adjustCalories   = kcal  => adjustCaloriesFor(kcal, inclineMode);
+const normalizeSession = s     => normalizeSessionFor(s, unitOfDistance());
+
+/** Notification speed → kph. The treadmill always reports metric. */
+const rawKph = raw => raw.current_speed / 1000;
+
+/** Command frame in the current screen unit. Pause/stop keep the protocol's
+ *  default speed field, as they always have. */
+const packet = (type, speed = 1000) => makePacket(type, speed, unitMode);
 
 
-// ---- 5. Helpers -----------------------------------------------------------
-
-function startOfThisMonth() {
-    const d = new Date();
-    return new Date(d.getFullYear(), d.getMonth(), 1);
-}
-
-function dayKey(d) {
-    const date = d instanceof Date ? d : new Date(d);
-    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-}
-
-/** Stopwatch style: "0:00", "12:34", or "1:02:03" once it passes an hour. */
-function formatDuration(seconds) {
-    seconds = Math.max(0, Math.floor(Number(seconds) || 0));
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const s = String(seconds % 60).padStart(2, '0');
-    return h > 0
-        ? `${h}:${String(m).padStart(2, '0')}:${s}`
-        : `${m}:${s}`;
-}
-
-function unitOfDistance() { return unitMode === 'mph' ? 'mi' : 'km'; }
-
-function convertDistance(value, from, to) {
-    if (!value || from === to) return value;
-    return from === 'km' ? value / KM_PER_MI : value * KM_PER_MI;
-}
-
-/** User-facing speed (in the current unit) → native treadmill units (kph×1000). */
-function userToKU(v) {
-    const ku = unitMode === 'mph'
-        ? Math.round(v * KM_PER_MI * 1000)
-        : Math.round(v * 1000);
-    return Math.min(KU_MAX, Math.max(KU_MIN, ku));
-}
-
-/** Native treadmill units (kph×1000) → user-facing value in the current unit. */
-function kuToUser(ku) {
-    const kph = ku / 1000;
-    return unitMode === 'mph' ? kph / KM_PER_MI : kph;
-}
-
-/**
- * Firmware doesn't fold the manual incline switch into its calorie count.
- * Apply a flat correction when the user has selected the incline grade.
- */
-function adjustCalories(rawKcal) {
-    const n = Number(rawKcal) || 0;
-    return Math.round(inclineMode === INCLINE_GRADE ? n * INCLINE_KCAL_FACTOR : n);
-}
-
-/**
- * The treadmill reports speed/distance in METRIC (kph×1000, metres)
- * regardless of the unit shown on its screen — `reported_unit` (the
- * FLAG_UNIT_MPH bit) only reflects the on-screen label, not the value's
- * unit. So canonicalizing is just /1000; everything downstream converts
- * kph/km → the user's chosen unit. (A hardware screenshot showed speed
- * reading ~1.6× high when we multiplied by KM_PER_MI here.)
- */
-function rawKph(raw) { return raw.current_speed / 1000; }
-function rawKm(raw)  { return raw.distance / 1000; }
-
-/**
- * ACSM walking metabolic equation. The treadmill caps ~3.8 mph, so walking
- * (not running) applies throughout. Returns kcal per minute.
- *   S    = speed in m/min
- *   VO2  = 0.1·S + 1.8·S·grade + 3.5   (ml/kg/min)
- *   kcal/min = VO2 · weightKg · 5 / 1000   (≈5 kcal per L O2)
- * Incline is part of the formula, so no separate factor is needed here.
- */
-function estimateKcalPerMin(speedKph, gradeFrac, weightKg) {
-    const S = speedKph * 1000 / 60;
-    const vo2 = 0.1 * S + 1.8 * S * gradeFrac + 3.5;
-    return vo2 * weightKg * 5 / 1000;
-}
-
-/** Walking stride length (m) from standing height (cm). */
-function strideMeters(heightCm) {
-    return STRIDE_FACTOR * heightCm / 100;
-}
-
-/**
- * Project a stored session onto `{ date, distance, calories }` in the user's
- * current display unit. Tolerant of older session shapes that lack
- * `distanceUnit` or stored calories as a string.
- */
-function normalizeSession(s) {
-    if (!s || typeof s.date !== 'number') return null;
-    const from = s.distanceUnit || (s.speedUnit === 'mph' ? 'mi' : 'km');
-    return {
-        date:     s.date,
-        distance: convertDistance(Number(s.distance) || 0, from, unitOfDistance()),
-        calories: Math.round(Number(s.calories) || 0),
-    };
-}
-
-
-// ---- 6. Bluetooth ---------------------------------------------------------
+// ---- 5. Bluetooth ---------------------------------------------------------
 
 async function connectBluetooth() {
+    if (!bluetoothSupported) return;
+    cancelReconnect();
     setStatus('connecting');
     loadingOverlay.hidden = false;
     try {
@@ -398,18 +263,11 @@ async function connectBluetooth() {
             filters: [{ services: [SERVICE_UUID] }],
             services: [SERVICE_UUID]
         });
+        // Re-adding on every connect would stack duplicate handlers, since the
+        // browser hands back the same BluetoothDevice for the same hardware.
+        device.removeEventListener('gattserverdisconnected', onDisconnected);
         device.addEventListener('gattserverdisconnected', onDisconnected);
-        server = await device.gatt.connect();
-        const service = await server.getPrimaryService(SERVICE_UUID);
-        notifyChar = await service.getCharacteristic(NOTIFY_CHAR_UUID);
-        writeChar  = await service.getCharacteristic(WRITE_CHAR_UUID);
-        await notifyChar.startNotifications();
-        notifyChar.addEventListener('characteristicvaluechanged', handleNotification);
-        connected = true;
-        connectBtn.textContent = 'Disconnect';
-        updateRunningState(3);
-        // Push the user's chosen unit to the treadmill on connect.
-        pendingCommand = makePacket('set_speed', curTargetSpeed);
+        await openGatt();
     } catch (err) {
         console.error('Bluetooth connection error:', err);
         showToast('Bluetooth error: ' + err.message);
@@ -421,134 +279,87 @@ async function connectBluetooth() {
     }
 }
 
+/** Open GATT on the already-chosen `device` and wire up notifications.
+ *  Shared by the initial connect and by reconnect attempts. */
+async function openGatt() {
+    server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    notifyChar = await service.getCharacteristic(NOTIFY_CHAR_UUID);
+    writeChar  = await service.getCharacteristic(WRITE_CHAR_UUID);
+    await notifyChar.startNotifications();
+    notifyChar.removeEventListener('characteristicvaluechanged', handleNotification);
+    notifyChar.addEventListener('characteristicvaluechanged', handleNotification);
+    connected = true;
+    userDisconnect = false;
+    connectBtn.textContent = 'Disconnect';
+    updateRunningState(STATE.STOPPED);
+    // Push the user's chosen unit to the treadmill on connect.
+    pendingCommand = packet('set_speed', curTargetSpeed);
+}
+
 function disconnectBluetooth() {
+    userDisconnect = true;
+    cancelReconnect();
     if (device?.gatt?.connected) device.gatt.disconnect();
     loadingOverlay.hidden = true;
 }
 
 function onDisconnected() {
     connected = false;
+    notifyChar = null;
+    writeChar = null;
     connectBtn.textContent = 'Connect';
-    updateRunningState(3); // also sets status to disconnected when !connected
-    if (chartDebug) chartDebug.hidden = true;
-    if (sessionActive) finishSession();
-}
+    releaseWakeLock();
 
-/** @param {DataView} value */
-function decodeNotification(value) {
-    const u16 = o => (value.getUint8(o) << 8) | value.getUint8(o + 1);
-    const u32 = o => (value.getUint8(o) << 24) | (value.getUint8(o + 1) << 16) |
-                     (value.getUint8(o + 2) << 8) | value.getUint8(o + 3);
-
-    const flags = value.getUint8(BLE.OFFSET_FLAGS);
-    const stateBits = flags & BLE.FLAG_STATE_MASK;
-    const running_state =
-        stateBits === BLE.FLAG_STATE_STARTING ? 0 :
-        stateBits === BLE.FLAG_STATE_RUNNING  ? 1 :
-        stateBits === BLE.FLAG_STATE_PAUSED   ? 2 : 3;
-
-    return {
-        // Notification speed/distance are in the treadmill's *display* unit
-        // (reported_unit) × 1000 — NOT metric. (The command packet's speed is
-        // the one that's always kph; the two paths differ.)
-        current_speed: u16(BLE.OFFSET_CURRENT_SPEED),  // reported_unit × 1000
-        distance:      u32(BLE.OFFSET_DISTANCE),        // reported_unit dist × 1000
-        calories:      u16(BLE.OFFSET_CALORIES),
-        steps:         u32(BLE.OFFSET_STEPS),
-        duration:      Math.round(u32(BLE.OFFSET_DURATION_MS) / 1000),
-        reported_unit: (flags & BLE.FLAG_UNIT_MPH) ? 'mph' : 'kph',
-        running_state,
-    };
-}
-
-function handleNotification(event) {
-    const value = event.target.value;
-
-    if (value.byteLength < BLE.MIN_PACKET_LEN) {
-        lastRaw = null;
-        updateDashboard({});
-        updateRunningState(3);
-        if (sessionActive) finishSession();
+    // Deliberate disconnect, or nothing in flight: just close out.
+    if (userDisconnect || !session) {
+        userDisconnect = false;
+        if (session) finishSession();
+        updateRunningState(STATE.STOPPED);
         return;
     }
 
-    const raw = decodeNotification(value);
-    lastRaw = raw;
-    updateDashboard(buildDisplayFromRaw(raw));
-    updateRunningState(raw.running_state);
-    trackSession(raw);
-    updateDebug(raw);
-    sendQueuedOrHeartbeat();
+    // Dropped mid-workout. The belt is still moving; keep the session open and
+    // try to get back before writing it off.
+    setStatus('reconnecting');
+    enableControls(false);
+    scheduleReconnect(0);
 }
 
-/** TEMPORARY diagnostic line under the chart — confirms exactly what the
- *  treadmill sends so we can finalize the unit/duration handling, then
- *  remove this. Visible only while connected. */
-function updateDebug(raw) {
-    if (!chartDebug) return;
-    const sess = sessionStartData ? raw.duration - sessionStartData.startDuration : 0;
-    chartDebug.textContent =
-        `debug cs=${raw.current_speed} dist=${raw.distance} u=${raw.reported_unit} ` +
-        `durRaw=${raw.duration}s durSess=${sess}s`;
-    chartDebug.hidden = !connected;
-}
-
-/** Record the minute slot for the chart. We store the LAST sample of each
- *  minute (the belt's actual speed/incline at that point) rather than the
- *  minute average — averaging dragged the line above the live treadmill
- *  reading whenever the speed had been changed within the minute. Speed is
- *  kept in canonical kph so a mid-session unit toggle re-scales correctly. */
-function recordSample(raw) {
-    const base = sessionStartData ? sessionStartData.startDuration : raw.duration;
-    const minute = Math.max(0, Math.floor((raw.duration - base) / 60));
-    const slot = sessionSamples[minute] ||
-        (sessionSamples[minute] = { kph: 0, incline: inclineMode, steps: 0 });
-    slot.kph = rawKph(raw);
-    slot.incline = inclineMode;
-    slot.steps = profile.heightCm != null ? Math.round(estSteps) : raw.steps;
-}
-
-function trackSession(raw) {
-    const running = raw.running_state === 1;
-    if (running && !sessionActive) {
-        sessionActive = true;
-        sessionStartData = {
-            date: Date.now(),
-            steps: raw.steps, calories: raw.calories, distance: raw.distance,
-            duration: raw.duration, prevDuration: raw.duration,
-            // Immutable baseline: the treadmill's duration counter is
-            // cumulative (not reset per session), so the chart/Duration use
-            // elapsed = raw.duration - startDuration. Never reassigned.
-            startDuration: raw.duration,
-            speedSum: raw.current_speed, speedCount: 1,
-        };
-        estKcal = 0;
-        estSteps = 0;
-        sessionSamples = [];
-        recordSample(raw);
-        upsertLiveSession();
-    } else if (running && sessionStartData) {
-        const dt = Math.max(0, raw.duration - sessionStartData.prevDuration);
-        if (dt > 0 && profile.weightKg != null) {
-            estKcal += estimateKcalPerMin(rawKph(raw), inclineMode / 100, profile.weightKg) * (dt / 60);
-        }
-        if (dt > 0 && profile.heightCm != null) {
-            // Integrate speed×time so the count rises every tick instead of
-            // jumping with the treadmill's coarse distance field.
-            const metres = rawKph(raw) * 1000 * (dt / 3600);
-            estSteps += metres / strideMeters(profile.heightCm);
-        }
-        Object.assign(sessionStartData, {
-            steps: raw.steps, calories: raw.calories, distance: raw.distance,
-            duration: raw.duration, prevDuration: raw.duration,
-        });
-        sessionStartData.speedSum += raw.current_speed;
-        sessionStartData.speedCount += 1;
-        recordSample(raw);
-        upsertLiveSession();
-    } else if (!running && sessionActive) {
+function scheduleReconnect(attempt) {
+    if (attempt >= RECONNECT_DELAYS_MS.length) {
+        showToast('Lost connection — session saved');
         finishSession();
+        updateRunningState(STATE.STOPPED);
+        return;
     }
+    reconnectTimer = setTimeout(async () => {
+        reconnectTimer = null;
+        try {
+            await openGatt();
+            showToast('Reconnected');
+        } catch {
+            scheduleReconnect(attempt + 1);
+        }
+    }, RECONNECT_DELAYS_MS[attempt]);
+}
+
+function cancelReconnect() {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+}
+
+function handleNotification(event) {
+    const raw = decodeNotification(event.target.value);
+    if (!raw) {
+        // Runt frame — treat as "no reliable data" but don't tear down a live
+        // session over one bad packet; the next tick usually recovers.
+        return;
+    }
+    trackSession(raw);
+    updateDashboard();
+    updateRunningState(raw.running_state);
+    sendQueuedOrHeartbeat();
 }
 
 function sendQueuedOrHeartbeat() {
@@ -562,132 +373,217 @@ function sendQueuedOrHeartbeat() {
     }
 }
 
-function upsertLiveSession() {
-    if (!sessionStartData) return;
-    const s = sessionStartData;
-    // Notification fields are already metric (m / kph×1000); store canonical
-    // km / kph so the calendar/detail views convert per the user's choice.
-    const distKm = s.distance / 1000;
-    const avgKph = (s.speedSum / s.speedCount) / 1000;
-    // Use the profile-based estimates when available so stored history matches
-    // the live dashboard; otherwise the firmware numbers (incline-adjusted).
-    const calories = profile.weightKg != null
-        ? Math.round(estKcal)
-        : adjustCalories(s.calories);
-    const steps = profile.heightCm != null ? Math.round(estSteps) : s.steps;
-    const session = {
-        date: s.date,
-        duration: s.duration,
-        steps,
-        calories,
-        rawCalories: s.calories,
-        distance: distKm,
+
+// ---- 6. Session tracking --------------------------------------------------
+
+function trackSession(raw) {
+    const running = raw.running_state === STATE.RUNNING;
+
+    if (running && !session) {
+        const snapshot = {
+            duration: raw.duration, distance: raw.distance,
+            steps: raw.steps, calories: raw.calories,
+        };
+        session = {
+            date: Date.now(),
+            baseline: { ...snapshot },
+            latest:   { ...snapshot },
+            prevDuration: raw.duration,
+            speedSum: raw.current_speed, speedCount: 1,
+            estKcal: 0, estSteps: 0,
+            samples: [],
+        };
+        lastFinished = null;
+        recordSample(raw);
+        persistSession({ force: true });
+        return;
+    }
+
+    if (running) {
+        const dt = Math.max(0, raw.duration - session.prevDuration);
+        if (dt > 0 && profile.weightKg != null) {
+            session.estKcal +=
+                estimateKcalPerMin(rawKph(raw), inclineMode / 100, profile.weightKg) * (dt / 60);
+        }
+        if (dt > 0 && profile.heightCm != null) {
+            // Integrate speed×time so the count rises every tick instead of
+            // jumping with the treadmill's coarse distance field.
+            const metres = rawKph(raw) * 1000 * (dt / 3600);
+            session.estSteps += metres / strideMeters(profile.heightCm);
+        }
+        session.latest = {
+            duration: raw.duration, distance: raw.distance,
+            steps: raw.steps, calories: raw.calories,
+        };
+        session.prevDuration = raw.duration;
+        session.speedSum += raw.current_speed;
+        session.speedCount += 1;
+        recordSample(raw);
+        persistSession();
+        return;
+    }
+
+    if (session) {
+        // This stop/pause frame may be the first thing we see after a
+        // reconnect gap, in which case it carries the counters for the stretch
+        // we missed — the run auto-reconnect exists to preserve. Take them,
+        // but only where they moved forward: if the firmware zeroes a counter
+        // on stop, keeping what we already have beats wiping the session.
+        adoptAdvancedCounters(raw);
+        finishSession();
+    }
+}
+
+/**
+ * Merge in any counter that advanced past what we last saw, and extend the
+ * profile-based estimates over the same stretch.
+ *
+ * A stop frame reports the belt at 0, so it can't tell us how fast the missed
+ * stretch was walked; the session's average pace is the best available stand-in.
+ * Reconnect gives up after ~30s, which bounds how much this can invent.
+ */
+function adoptAdvancedCounters(raw) {
+    const dt = Math.max(0, raw.duration - session.prevDuration);
+    if (dt > 0) {
+        const avgKph = (session.speedSum / session.speedCount) / 1000;
+        if (profile.weightKg != null) {
+            session.estKcal +=
+                estimateKcalPerMin(avgKph, inclineMode / 100, profile.weightKg) * (dt / 60);
+        }
+        if (profile.heightCm != null) {
+            session.estSteps += (avgKph * 1000 * (dt / 3600)) / strideMeters(profile.heightCm);
+        }
+        session.prevDuration = raw.duration;
+    }
+    for (const k of ['duration', 'distance', 'steps', 'calories']) {
+        if (raw[k] > session.latest[k]) session.latest[k] = raw[k];
+    }
+}
+
+/** Record the minute slot for the chart. We store the LAST sample of each
+ *  minute (the belt's actual speed/incline at that point) rather than the
+ *  minute average — averaging dragged the line above the live treadmill
+ *  reading whenever the speed had been changed within the minute. Speed is
+ *  kept in canonical kph so a mid-session unit toggle re-scales correctly. */
+function recordSample(raw) {
+    const minute = Math.max(0, Math.floor((raw.duration - session.baseline.duration) / 60));
+    const slot = session.samples[minute] ||
+        (session.samples[minute] = { kph: 0, incline: inclineMode, steps: 0 });
+    slot.kph = rawKph(raw);
+    slot.incline = inclineMode;
+    slot.steps = sessionTotals().steps;
+}
+
+/** Totals for whichever session the dashboard should be showing (live, else
+ *  the last completed one), or null if there's nothing to show yet. */
+function sessionTotals() {
+    const s = session || lastFinished;
+    if (!s) return null;
+    const delta = k => Math.max(0, s.latest[k] - s.baseline[k]);
+    return {
+        duration:   delta('duration'),
+        distanceKm: delta('distance') / 1000,
+        steps:      profile.heightCm != null ? Math.round(s.estSteps) : delta('steps'),
+        calories:   profile.weightKg != null ? Math.round(s.estKcal) : adjustCalories(delta('calories')),
+        rawCalories: delta('calories'),
+        avgKph:     (s.speedSum / s.speedCount) / 1000,
+    };
+}
+
+/** The current session as a storable record. */
+function buildSessionRecord() {
+    const t = sessionTotals();
+    if (!session || !t) return null;
+    return {
+        date: session.date,
+        duration: t.duration,
+        steps: t.steps,
+        calories: t.calories,
+        rawCalories: t.rawCalories,
+        distance: t.distanceKm,
         distanceUnit: 'km',
-        avgSpeed: avgKph,
+        avgSpeed: t.avgKph,
         speedUnit: 'kph',
         inclineApplied: inclineMode,
     };
+}
+
+/** Write the live session through to storage, at most every
+ *  PERSIST_INTERVAL_MS unless forced. */
+function persistSession({ force = false } = {}) {
+    if (!session) return;
+    const now = Date.now();
+    if (!force && now - lastPersistAt < PERSIST_INTERVAL_MS) return;
+    lastPersistAt = now;
+    writeSessionRecord();
+}
+
+function writeSessionRecord() {
+    const record = buildSessionRecord();
+    if (!record) return;
     const sessions = loadSessions();
-    if (sessions[0] && sessions[0].date === session.date) sessions[0] = session;
-    else sessions.unshift(session);
+    const i = sessions.findIndex(s => s && s.date === record.date);
+    if (i >= 0) sessions[i] = record;
+    else sessions.unshift(record);
     saveSessions(sessions);
-    renderCalendar();
-    if (selectedDayKey) renderDayDetail(selectedDayKey);
+    markHistoryDirty();
 }
 
 function finishSession() {
-    sessionActive = false;
-    sessionStartData = null;
+    if (!session) return;
+    const finished = session;
+
+    if (isJunkSession(buildSessionRecord())) {
+        // An accidental start/stop tap isn't a workout. A record already exists
+        // (we persist on the first running tick), so take it back out.
+        saveSessions(loadSessions().filter(s => s && s.date !== finished.date));
+        lastFinished = null;
+    } else {
+        writeSessionRecord();              // final flush, unthrottled
+        lastFinished = finished;
+    }
+
+    session = null;
+    lastPersistAt = 0;
+    releaseWakeLock();
+    markHistoryDirty();
+    updateDashboard();
 }
 
 
-// ---- 7. Packet builder ----------------------------------------------------
-
-/**
- * Build a 23-byte command packet for the treadmill.
- *
- *   [0]      START_BYTE (0x6A)
- *   [1]      length (0x17 = 23)
- *   [2..5]   reserved (zero)
- *   [6..7]   target speed, kph × 1000 (big-endian u16). ALWAYS kph — the
- *            unit bit below only changes the treadmill's on-screen label.
- *   [8]      magic: 5 for set_speed, 1 otherwise
- *   [9]      incline (always 0 — incline is a mechanical switch)
- *   [10]     weight (kg; default 80)
- *   [11]     reserved
- *   [12]     command nibble + unit bit. 4=start, 2=pause, 0=stop.
- *            OR 0x08 (CMD_UNIT_MPH_BIT) to label the screen in mph.
- *   [13..20] user ID (8 bytes; protocol-default constant)
- *   [21]     XOR checksum of bytes 1..20
- *   [22]     END_BYTE (0x43)
- *
- * @param {'start'|'pause'|'stop'|'set_speed'} type
- * @param {number} [speed=1000] target speed in kph × 1000
- * @returns {Uint8Array}
- */
-function makePacket(type, speed = 1000) {
-    const arr = new Uint8Array(23);
-    arr[0] = BLE.START_BYTE;
-    arr[1] = 0x17;
-    arr[6] = (speed >> 8) & 0xFF;
-    arr[7] = speed & 0xFF;
-    arr[8] = type === 'set_speed' ? 5 : 1;
-    arr[10] = 80;
-    const baseCmd = type === 'pause' ? 2 : type === 'stop' ? 0 : 4;
-    arr[12] = unitMode === 'mph'
-        ? (baseCmd | BLE.CMD_UNIT_MPH_BIT)
-        : (baseCmd & BLE.CMD_KPH_MASK);
-    arr.set(USER_ID_BYTES, 13);
-    let xor = 0;
-    for (let i = 1; i <= 20; ++i) xor ^= arr[i];
-    arr[21] = xor;
-    arr[22] = BLE.END_BYTE;
-    return arr;
-}
-
-
-// ---- 8. Display -----------------------------------------------------------
+// ---- 7. Display -----------------------------------------------------------
 
 const STATUS = {
     connecting:   { label: 'Connecting',   cls: 'chip-connecting' },
+    reconnecting: { label: 'Reconnecting', cls: 'chip-connecting' },
     running:      { label: 'Running',      cls: 'chip-connected' },
     paused:       { label: 'Paused',       cls: 'chip-paused' },
     stopped:      { label: 'Stopped',      cls: 'chip-paused' },
     disconnected: { label: 'Disconnected', cls: 'chip-disconnected' },
+    unsupported:  { label: 'Unsupported',  cls: 'chip-disconnected' },
 };
+
 function setStatus(state) {
     const { label, cls } = STATUS[state] || STATUS.disconnected;
     statusChip.textContent = label;
     statusChip.className = 'chip ' + cls;
 }
 
-function buildDisplayFromRaw(raw) {
-    // rawKph/rawKm canonicalize (metric); present in the user's chosen unit.
-    // Calories/steps use the profile estimate when set, else firmware.
-    // Duration is session-relative (treadmill's counter is cumulative).
-    const userUnit = unitOfDistance();
-    const sessionSecs = sessionStartData
-        ? raw.duration - sessionStartData.startDuration
-        : raw.duration;
-    return {
-        distanceDisplay: convertDistance(rawKm(raw), 'km', userUnit).toFixed(2) + ' ' + userUnit,
-        calories: profile.weightKg != null ? Math.round(estKcal) : adjustCalories(raw.calories),
-        steps:    profile.heightCm != null ? Math.round(estSteps) : raw.steps,
-        duration: Math.max(0, sessionSecs),
-    };
-}
-
-function updateDashboard(d) {
-    distanceDiv.textContent = d?.distanceDisplay ?? '—';
-    caloriesDiv.textContent = (d?.calories != null) ? d.calories + ' kcal' : '—';
-    stepsDiv.textContent    = (d?.steps != null) ? d.steps : '—';
-    durationDiv.textContent = (d?.duration != null) ? formatDuration(d.duration) : '—';
+function updateDashboard() {
+    const t = sessionTotals();
+    if (!t) {
+        distanceDiv.textContent = '—';
+        caloriesDiv.textContent = '—';
+        stepsDiv.textContent    = '—';
+        durationDiv.textContent = '—';
+    } else {
+        const unit = unitOfDistance();
+        distanceDiv.textContent = convertDistance(t.distanceKm, 'km', unit).toFixed(2) + ' ' + unit;
+        caloriesDiv.textContent = t.calories + ' kcal';
+        stepsDiv.textContent    = String(t.steps);
+        durationDiv.textContent = formatDuration(t.duration);
+    }
     renderChart();
-}
-
-function refreshDashboard() {
-    if (lastRaw) updateDashboard(buildDisplayFromRaw(lastRaw));
-    else updateDashboard({});
 }
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -699,13 +595,15 @@ function svgEl(name, attrs, cls) {
 }
 
 /**
- * Hand-rolled SVG chart of the current session: per-minute average speed on
- * the left axis, cumulative steps on the right axis, plus a faint stepped
- * incline band. 30-minute window, extended by 30 once the user reaches minute
- * 29 (then 59, …). Steps axis starts at 2000, grows by 1000 past 75% full.
+ * Hand-rolled SVG chart of the current session: per-minute speed on the left
+ * axis, cumulative steps on the right axis, plus a faint stepped incline band.
+ * 30-minute window, extended by 30 once the user reaches minute 29 (then 59,
+ * …). Steps axis starts at 2000, grows by 1000 past 75% full.
  */
 function renderChart() {
     if (!sessionChart) return;
+    const samples = (session || lastFinished)?.samples || [];
+
     // Match the viewBox to the element's real pixel size (1 unit = 1 px) so
     // text isn't stretched — preserveAspectRatio default keeps it 1:1.
     const VB_H = 160;
@@ -713,7 +611,7 @@ function renderChart() {
     const x0 = 30, x1 = VB_W - 30, yTop = 10, yBot = 140;  // right margin = steps axis
     const plotW = x1 - x0, plotH = yBot - yTop;
 
-    const lastMinute = sessionSamples.length - 1;            // -1 if empty
+    const lastMinute = samples.length - 1;                   // -1 if empty
     let windowMin = 30;
     while (lastMinute >= windowMin - 1) windowMin += 30;
 
@@ -723,7 +621,7 @@ function renderChart() {
     // Secondary (right) axis: cumulative steps. Starts at 2000, grows by 1000
     // once the count passes 75% of the current top.
     let maxSteps = 0;
-    for (const s of sessionSamples) if (s && s.steps > maxSteps) maxSteps = s.steps;
+    for (const s of samples) if (s && s.steps > maxSteps) maxSteps = s.steps;
     let stepMax = 2000;
     while (maxSteps > 0.75 * stepMax) stepMax += 1000;
 
@@ -767,7 +665,7 @@ function renderChart() {
     if (lastMinute >= 0) {
         let dPath = `M ${x0} ${yBot}`;
         for (let m = 0; m <= lastMinute; m++) {
-            const inc = sessionSamples[m] ? sessionSamples[m].incline : 0;
+            const inc = samples[m] ? samples[m].incline : 0;
             dPath += ` L ${xFor(m)} ${yInc(inc)} L ${xFor(m + 1)} ${yInc(inc)}`;
         }
         dPath += ` L ${xFor(lastMinute + 1)} ${yBot} Z`;
@@ -777,7 +675,7 @@ function renderChart() {
     // speed polyline: last sample of each minute, plotted at the minute centre
     const pts = [];
     for (let m = 0; m <= lastMinute; m++) {
-        const s = sessionSamples[m];
+        const s = samples[m];
         if (!s) continue;
         const disp = unitMode === 'mph' ? s.kph / KM_PER_MI : s.kph;
         pts.push(`${xFor(m + 0.5).toFixed(1)},${ySpd(disp).toFixed(1)}`);
@@ -792,7 +690,7 @@ function renderChart() {
     // cumulative steps polyline on the right axis
     const stepPts = [];
     for (let m = 0; m <= lastMinute; m++) {
-        const s = sessionSamples[m];
+        const s = samples[m];
         if (!s) continue;
         stepPts.push(`${xFor(m + 0.5).toFixed(1)},${yStep(s.steps).toFixed(1)}`);
     }
@@ -818,15 +716,18 @@ function updateRunningState(state) {
     if (!connected) {
         enableControls(false);
         startBtn.textContent = 'Start';
-        setStatus('disconnected');
+        if (!reconnectTimer) setStatus(bluetoothSupported ? 'disconnected' : 'unsupported');
         return;
     }
-    enableControls(state !== 0);                          // disable during "Starting"
-    startBtn.textContent = state === 1 ? 'Pause' : 'Start';
-    if      (state === 1) setStatus('running');
-    else if (state === 2) setStatus('paused');
-    else if (state === 3) setStatus('stopped');
-    // state === 0: leave chip as-is (typically "Stopped" → "Starting" briefly)
+    enableControls(state !== STATE.STARTING);             // disable during "Starting"
+    startBtn.textContent = state === STATE.RUNNING ? 'Pause' : 'Start';
+    if      (state === STATE.RUNNING) setStatus('running');
+    else if (state === STATE.PAUSED)  setStatus('paused');
+    else if (state === STATE.STOPPED) setStatus('stopped');
+    // STARTING: leave chip as-is (typically "Stopped" → "Starting" briefly)
+
+    if (state === STATE.RUNNING) requestWakeLock();
+    else releaseWakeLock();
 }
 
 function applyUnitToSlider() {
@@ -839,17 +740,22 @@ function applyUnitToSlider() {
     // slider and the queued command never diverge.
     const v = Math.min(r.max, Math.max(r.min, kuToUser(curTargetSpeed)));
     curTargetSpeed = userToKU(v);
+    setSliderDisplay(v);
+    renderPresets();
+}
+
+function setSliderDisplay(v) {
     speedSlider.value = v.toFixed(1);
     sliderValue.textContent = v.toFixed(1);
-    renderPresets();
+    // Without this a screen reader announces a bare "1.0" with no unit.
+    speedSlider.setAttribute('aria-valuetext', `${v.toFixed(1)} ${SPEED_RANGE[unitMode].label}`);
 }
 
 function setTargetSpeed(userValue) {
     const r = SPEED_RANGE[unitMode];
     const clamped = Math.min(r.max, Math.max(r.min, userValue));
     curTargetSpeed = userToKU(clamped);
-    speedSlider.value = clamped.toFixed(1);
-    sliderValue.textContent = clamped.toFixed(1);
+    setSliderDisplay(clamped);
     renderPresets();
 }
 
@@ -868,9 +774,8 @@ function setUnit(newUnit) {
     // slider/readout presentation changes — the physical target is unchanged,
     // so there's no need to resend a command.
     applyUnitToSlider();
-    refreshDashboard();
-    renderCalendar();
-    if (selectedDayKey) renderDayDetail(selectedDayKey);
+    updateDashboard();
+    flushHistoryRender();
 }
 
 function setIncline(newIncline) {
@@ -879,9 +784,8 @@ function setIncline(newIncline) {
     inclineMode = n;
     localStorage.setItem(PREF_INCLINE, String(inclineMode));
     updateSegmentedActive(inclineToggle, String(inclineMode));
-    refreshDashboard();
-    renderCalendar();
-    if (selectedDayKey) renderDayDetail(selectedDayKey);
+    updateDashboard();
+    flushHistoryRender();
 }
 
 function updateSegmentedActive(group, value) {
@@ -893,57 +797,49 @@ function updateSegmentedActive(group, value) {
 }
 
 
-// ---- 9. History (calendar, day detail, import/export) --------------------
+// ---- 8. History (calendar, day detail, import/export) --------------------
 
-function aggregateByDay(sessions) {
-    const map = new Map();
-    for (const s of sessions) {
-        const n = normalizeSession(s);
-        if (!n) continue;
-        const key = dayKey(n.date);
-        let agg = map.get(key);
-        if (!agg) { agg = { distance: 0, calories: 0 }; map.set(key, agg); }
-        agg.distance += n.distance;
-        agg.calories += n.calories;
-    }
-    return map;
+function isHistoryVisible() {
+    return panels.history.classList.contains('is-active');
 }
 
-/** All-time totals across stored sessions: distance (user's unit), vertical
- *  climb (Σ session distance × incline grade; m in kph mode, ft in mph), and
- *  steps. */
-function renderLifetime() {
-    let dist = 0, steps = 0, climbM = 0;
-    for (const s of loadSessions()) {
-        const n = normalizeSession(s);
-        if (!n) continue;
-        dist += n.distance;
-        steps += Number(s.steps) || 0;
-        const from = s.distanceUnit || (s.speedUnit === 'mph' ? 'mi' : 'km');
-        const km = convertDistance(Number(s.distance) || 0, from, 'km');
-        const grade = (Number(s.inclineApplied) === INCLINE_GRADE ? INCLINE_GRADE : 0) / 100;
-        climbM += km * 1000 * grade;
-    }
-    lifeDistance.textContent = dist.toFixed(2) + ' ' + unitOfDistance();
+/** Note that stored history changed. Re-rendering the calendar means
+ *  re-reading and re-aggregating every session ever recorded, so while the
+ *  History tab is hidden we only set a flag and redraw when it's shown. */
+function markHistoryDirty() {
+    historyDirty = true;
+    if (isHistoryVisible()) flushHistoryRender();
+}
+
+function flushHistoryRender() {
+    historyDirty = false;
+    renderCalendar();
+    if (selectedDayKey) renderDayDetail(selectedDayKey);
+}
+
+/** All-time totals: distance and steps, plus vertical climb on the 7% grade
+ *  (metric in kph mode, imperial in mph mode — follows the unit toggle). */
+function renderLifetime(sessions) {
+    const unit = unitOfDistance();
+    const { distance, steps, climbM } = lifetimeTotals(sessions, unit);
+    lifeDistance.textContent = distance.toFixed(2) + ' ' + unit;
     lifeSteps.textContent = Math.round(steps).toLocaleString();
-    // Vertical elevation gained on the 7% grade — metric in kph mode,
-    // imperial in mph mode (follows the unit toggle).
-    lifeClimb.textContent = unitOfDistance() === 'mi'
+    lifeClimb.textContent = unit === 'mi'
         ? Math.round(climbM * FT_PER_M).toLocaleString() + ' ft'
         : Math.round(climbM).toLocaleString() + ' m';
 }
 
 function renderCalendar() {
-    renderLifetime();
-    const { startOfMonth, endOfMonth, eachDayOfInterval, format } = window.dateFns;
+    const sessions = loadSessions();
+    renderLifetime(sessions);
     calMonth.textContent = format(calViewDate, 'MMMM yyyy');
 
     const monthStart = startOfMonth(calViewDate);
     const days = eachDayOfInterval({ start: monthStart, end: endOfMonth(calViewDate) });
     const leadingPadding = (monthStart.getDay() + 6) % 7;  // Mon=0
-    const totals = aggregateByDay(loadSessions());
-    const todayKey = dayKey(new Date());
     const unit = unitOfDistance();
+    const totals = aggregateByDay(sessions, unit);
+    const todayKey = dayKey(new Date());
 
     calGrid.replaceChildren();
     for (let i = 0; i < leadingPadding; i++) {
@@ -977,12 +873,16 @@ function renderCalendar() {
             kcal.textContent = Math.round(t.calories) + ' kcal';
             tot.append(dist, kcal);
             cell.appendChild(tot);
+            cell.setAttribute('aria-label',
+                `${format(d, 'EEEE, MMM d')}: ${t.distance.toFixed(2)} ${unit}, ${Math.round(t.calories)} kcal`);
             cell.addEventListener('click', () => {
                 selectedDayKey = (selectedDayKey === key) ? null : key;
                 renderCalendar();
                 if (selectedDayKey) renderDayDetail(selectedDayKey);
                 else clearDayDetail();
             });
+        } else {
+            cell.disabled = true;
         }
         calGrid.appendChild(cell);
     }
@@ -1002,22 +902,24 @@ function renderDayDetail(key) {
 
     const header = document.createElement('div');
     header.className = 'day-detail-header';
-    header.textContent = `${window.dateFns.format(new Date(sessions[0].date), 'EEEE, MMM d')} — ${sessions.length} session${sessions.length > 1 ? 's' : ''}`;
+    header.textContent = `${format(new Date(sessions[0].date), 'EEEE, MMM d')} — ${sessions.length} session${sessions.length > 1 ? 's' : ''}`;
     dayDetail.appendChild(header);
 
     for (const s of sessions) {
         const n = normalizeSession(s);
         if (!n) continue;
+        const time = format(new Date(n.date), 'h:mm a');
         const row = document.createElement('div');
         row.className = 'session-row';
         row.append(
-            makeField('Time',     window.dateFns.format(new Date(n.date), 'h:mm a')),
+            makeField('Time',     time),
             makeField('Distance', `${n.distance.toFixed(2)} ${unit}`),
             makeField('Calories', `${n.calories} kcal`),
         );
         const del = document.createElement('button');
         del.className = 'icon-btn';
         del.title = 'Delete';
+        del.setAttribute('aria-label', `Delete the ${time} session`);
         del.textContent = '×';
         del.addEventListener('click', () => deleteSessionByDate(s.date));
         row.appendChild(del);
@@ -1041,7 +943,7 @@ function clearDayDetail() {
 }
 
 function navigateMonth(delta) {
-    calViewDate = window.dateFns.addMonths(calViewDate, delta);
+    calViewDate = addMonths(calViewDate, delta);
     clearDayDetail();
     renderCalendar();
 }
@@ -1058,25 +960,65 @@ function exportHistory() {
     showToast('History exported');
 }
 
+/**
+ * Import merges into the existing log rather than replacing it — a "restore
+ * from backup" that deletes everything recorded since the export is data loss,
+ * and there's no undo.
+ */
 function importHistory(file) {
     const reader = new FileReader();
+    reader.onerror = () => showToast('Could not read that file');
     reader.onload = ev => {
         try {
             const parsed = JSON.parse(ev.target.result);
             if (!Array.isArray(parsed)) { showToast('Invalid file format'); return; }
-            const cleaned = parsed.map(cleanSession).filter(Boolean);
-            saveSessions(cleaned);
-            renderCalendar();
-            const dropped = parsed.length - cleaned.length;
-            showToast(dropped > 0
-                ? `Imported ${cleaned.length} (skipped ${dropped})`
-                : 'History imported');
+            const { sessions, added, duplicate, skipped } = mergeSessions(loadSessions(), parsed);
+            // Announcing a restore that didn't persist is worse than no
+            // restore — saveSessions has already explained the failure.
+            if (!saveSessions(sessions)) return;
+            flushHistoryRender();
+
+            const notes = [];
+            if (duplicate) notes.push(`${duplicate} already present`);
+            if (skipped)   notes.push(`${skipped} unreadable`);
+            showToast(notes.length
+                ? `Imported ${added} (${notes.join(', ')})`
+                : `Imported ${added} session${added === 1 ? '' : 's'}`);
         } catch (err) {
             showToast('Failed to import: ' + err.message);
         }
     };
     reader.readAsText(file);
 }
+
+
+// ---- 9. Wake lock ---------------------------------------------------------
+
+/** Keep the screen on while the belt is moving — otherwise the dashboard
+ *  blanks mid-walk and you have to reach over and tap it. */
+async function requestWakeLock() {
+    if (!('wakeLock' in navigator) || wakeLock) return;
+    try {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => { wakeLock = null; });
+    } catch {
+        // Denied, or the document isn't visible. Harmless — carry on without it.
+    }
+}
+
+function releaseWakeLock() {
+    if (!wakeLock) return;
+    const lock = wakeLock;
+    wakeLock = null;
+    lock.release().catch(() => {});
+}
+
+// The system drops the lock whenever the tab is hidden, so re-take it on return.
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && connected && runningState === STATE.RUNNING) {
+        requestWakeLock();
+    }
+});
 
 
 // ---- 10. Wiring & init ----------------------------------------------------
@@ -1111,7 +1053,18 @@ function showToast(message, timeout = 3500) {
 function bumpSpeed(deltaUserValue) {
     if (!connected) return;
     setTargetSpeed(kuToUser(curTargetSpeed) + deltaUserValue);
-    pendingCommand = makePacket('set_speed', curTargetSpeed);
+    pendingCommand = packet('set_speed', curTargetSpeed);
+}
+
+/** Start, or pause/resume if a run is already under way. */
+function toggleRun() {
+    if (!connected) return;
+    if (runningState === STATE.RUNNING) {
+        pendingCommand = packet('pause');
+        return;
+    }
+    showCountdown();
+    pendingCommand = packet('start', curTargetSpeed);
 }
 
 // ---- Speed presets --------------------------------------------------------
@@ -1125,11 +1078,14 @@ function renderPresets() {
     for (const v of PRESETS[unitMode]) {
         const b = document.createElement('button');
         b.type = 'button';
-        b.className = 'preset-btn' + (Math.abs(v - cur) < 0.05 ? ' is-active' : '');
+        const active = Math.abs(v - cur) < 0.05;
+        b.className = 'preset-btn' + (active ? ' is-active' : '');
         b.textContent = v % 1 === 0 ? String(v) : v.toFixed(1);
+        b.setAttribute('aria-label', `${b.textContent} ${SPEED_RANGE[unitMode].label}`);
+        b.setAttribute('aria-pressed', String(active));
         b.addEventListener('click', () => {
             setTargetSpeed(v);
-            if (connected) pendingCommand = makePacket('set_speed', curTargetSpeed);
+            if (connected) pendingCommand = packet('set_speed', curTargetSpeed);
         });
         presetRow.appendChild(b);
     }
@@ -1139,6 +1095,7 @@ function renderPresets() {
 
 let modalWeightUnit = 'kg';
 let modalHeightUnit = 'cm';
+let focusBeforeModal = null;
 
 const round1 = n => Math.round(n * 10) / 10;
 
@@ -1152,10 +1109,16 @@ function openSettings() {
     heightInput.value = profile.heightCm == null ? ''
         : round1(modalHeightUnit === 'in' ? profile.heightCm / CM_PER_IN : profile.heightCm);
     for (const k in tileChecks) tileChecks[k].checked = profile.tiles[k];
+    focusBeforeModal = document.activeElement;
     settingsModal.hidden = false;
+    weightInput.focus();
 }
 
-function closeSettings() { settingsModal.hidden = true; }
+function closeSettings() {
+    settingsModal.hidden = true;
+    focusBeforeModal?.focus?.();
+    focusBeforeModal = null;
+}
 
 /** Show/hide each dashboard tile per profile.tiles. */
 function applyTileVisibility() {
@@ -1201,40 +1164,48 @@ function saveSettings() {
     saveProfile({ weightKg, heightCm, weightUnit: modalWeightUnit, heightUnit: modalHeightUnit, tiles });
     closeSettings();
     applyTileVisibility();
-    refreshDashboard();
+    updateDashboard();
     showToast('Settings saved');
 }
+
+// Keep Tab inside the dialog while it's open, and let Escape dismiss it.
+const FOCUSABLE = 'button, input, [tabindex]:not([tabindex="-1"])';
+settingsModal.addEventListener('keydown', e => {
+    if (e.key === 'Escape') { e.preventDefault(); closeSettings(); return; }
+    if (e.key !== 'Tab') return;
+    const items = [...settingsModal.querySelectorAll(FOCUSABLE)].filter(el => !el.disabled);
+    if (items.length === 0) return;
+    const first = items[0], last = items[items.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault(); last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault(); first.focus();
+    }
+});
 
 // Connect
 connectBtn.addEventListener('click', () => connected ? disconnectBluetooth() : connectBluetooth());
 
 // Start / Stop
-startBtn.addEventListener('click', () => {
-    if (!connected) return;
-    if (runningState === 1) {
-        pendingCommand = makePacket('pause');
-        return;
-    }
-    showCountdown();
-    pendingCommand = makePacket('start', curTargetSpeed);
-});
+startBtn.addEventListener('click', toggleRun);
 stopBtn.addEventListener('click', () => {
-    if (connected) pendingCommand = makePacket('stop');
+    if (connected) pendingCommand = packet('stop');
 });
 
 // Speed buttons + slider
 speedUpBtn.addEventListener('click', () => bumpSpeed(+0.1));
 speedDownBtn.addEventListener('click', () => bumpSpeed(-0.1));
 speedSlider.addEventListener('input', () => {
-    sliderValue.textContent = parseFloat(speedSlider.value).toFixed(1);
+    setSliderDisplay(parseFloat(speedSlider.value));
 });
 speedSlider.addEventListener('change', () => {
     setTargetSpeed(parseFloat(speedSlider.value));
-    if (connected) pendingCommand = makePacket('set_speed', curTargetSpeed);
+    if (connected) pendingCommand = packet('set_speed', curTargetSpeed);
 });
 
-// Keyboard control: ←/→ adjust speed, ↓ toggles pause/resume.
-// OS key-repeat fires keydown rapidly while held, so rate-limit each action.
+// Keyboard control: ←/→ (and ↑/↓ for speed's sake, ↓ doubles as pause) plus
+// Space to start/pause. OS key-repeat fires keydown rapidly while a key is
+// held, so rate-limit each action.
 const KEY_THROTTLE_MS = { speed: 150, toggle: 600 };
 const lastKeyTime = { speed: 0, toggle: 0 };
 function keyAllowed(kind) {
@@ -1244,15 +1215,24 @@ function keyAllowed(kind) {
     return true;
 }
 
+/** Pause or resume, but only while a run is actually under way. */
+function keyTogglePause() {
+    if (!connected || (runningState !== STATE.RUNNING && runningState !== STATE.PAUSED)) return;
+    if (!keyAllowed('toggle')) return;
+    toggleRun();
+}
+
 window.addEventListener('keydown', e => {
     // Let native controls (slider, settings inputs) handle their own keys.
-    const tag = document.activeElement?.tagName;
+    const active = document.activeElement;
+    const tag = active?.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
     if (!settingsModal.hidden) return;
     if (e.altKey || e.ctrlKey || e.metaKey) return;
 
     switch (e.key) {
         case 'ArrowRight':
+        case 'ArrowUp':
             e.preventDefault();
             if (keyAllowed('speed')) bumpSpeed(+0.1);
             break;
@@ -1262,15 +1242,15 @@ window.addEventListener('keydown', e => {
             break;
         case 'ArrowDown':
             e.preventDefault();
-            // Only toggle while a session is active (running or paused).
-            if (!connected || (runningState !== 1 && runningState !== 2)) break;
-            if (!keyAllowed('toggle')) break;
-            if (runningState === 1) {
-                pendingCommand = makePacket('pause');
-            } else {
-                showCountdown();
-                pendingCommand = makePacket('start', curTargetSpeed);
-            }
+            keyTogglePause();
+            break;
+        case ' ':
+        case 'Spacebar':
+            // A focused button already treats Space as "activate" — don't
+            // fire the toggle twice.
+            if (tag === 'BUTTON') break;
+            e.preventDefault();
+            keyTogglePause();
             break;
     }
 });
@@ -1289,9 +1269,14 @@ wireSegmented(heightUnitToggle, setModalHeightUnit);
 
 // Tabs
 tabs.forEach(t => t.addEventListener('click', () => {
-    tabs.forEach(x => x.classList.toggle('is-active', x === t));
+    tabs.forEach(x => {
+        const active = x === t;
+        x.classList.toggle('is-active', active);
+        x.setAttribute('aria-selected', String(active));
+    });
     Object.entries(panels).forEach(([k, p]) => p.classList.toggle('is-active', k === t.dataset.tab));
-    if (t.dataset.tab === 'history') renderCalendar();
+    // Only rebuild if something changed while the tab was hidden.
+    if (t.dataset.tab === 'history' && historyDirty) flushHistoryRender();
 }));
 
 // Calendar navigation
@@ -1309,11 +1294,33 @@ importHistoryInput.addEventListener('change', () => {
 // Redraw the chart when the layout width changes (viewBox is width-derived).
 window.addEventListener('resize', renderChart);
 
+// Persistence is throttled during a session, so make sure the last few seconds
+// aren't lost when the tab goes away.
+window.addEventListener('pagehide', () => { if (session) writeSessionRecord(); });
+
+// Offline shell. Nothing here needs the network at runtime, so the installed
+// PWA shouldn't fall over when the network is down.
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register('sw.js').catch(err =>
+            console.warn('Service worker registration failed:', err));
+    });
+}
+
 // Init
 syncUnitToggles();
 updateSegmentedActive(inclineToggle, String(inclineMode));
 applyTileVisibility();
 applyUnitToSlider();   // also renders presets
-updateDashboard({});   // also draws empty chart
-updateRunningState(3);
+updateDashboard();     // also draws the empty chart
+updateRunningState(STATE.STOPPED);
 renderCalendar();      // also renders lifetime totals
+
+if (!bluetoothSupported) {
+    // Without this the Connect button throws a TypeError deep inside
+    // requestDevice and surfaces as "Cannot read properties of undefined".
+    connectBtn.disabled = true;
+    connectBtn.title = 'Web Bluetooth is not available in this browser';
+    unsupportedNotice.hidden = false;
+    setStatus('unsupported');
+}
