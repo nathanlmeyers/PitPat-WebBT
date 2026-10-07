@@ -5,7 +5,7 @@ A web-based dashboard to control and monitor a PitPat treadmill via Bluetooth. F
 ## Features
 
 - Connect, start/stop, pause, and adjust speed over Web Bluetooth
-- Minimal, modern UI with automatic light/dark mode
+- Minimal dark instrument UI with an electric lime accent
 - **KPH/MPH toggle** — re-bounds the slider and converts the readout. The treadmill's speed command is always metric internally, so the controller converts your chosen pace to the treadmill's native units before sending it
 - **0% / 7% / Auto incline** — the deck's manual riser isn't reported over Bluetooth, but the motor works measurably less uphill. Set the toggle by hand for a minute or so at each setting and the app learns the motor load for that speed; **Auto** then detects the grade within ~30 s of walking. Calories and climb use the detected grade
 - **Steps from the treadmill's real counter** — some firmware (37, for one) never fills the classic step field; the app reads the motor-side counter instead and only falls back to a height-based estimate when there is nothing to read

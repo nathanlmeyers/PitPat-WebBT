@@ -863,11 +863,13 @@ function updateRunningState(state) {
     if (!connected) {
         enableControls(false);
         startBtn.textContent = 'Start';
+        startBtn.dataset.action = 'start';
         if (!reconnectTimer) setStatus(bluetoothSupported ? 'disconnected' : 'unsupported');
         return;
     }
     enableControls(state !== STATE.STARTING);             // disable during "Starting"
     startBtn.textContent = state === STATE.RUNNING ? 'Pause' : 'Start';
+    startBtn.dataset.action = state === STATE.RUNNING ? 'pause' : 'start';
     if      (state === STATE.RUNNING) setStatus('running');
     else if (state === STATE.PAUSED)  setStatus('paused');
     else if (state === STATE.STOPPED) setStatus('stopped');
