@@ -4,8 +4,7 @@
     <meta charset="UTF-8">
     <title>PitPat Treadmill</title>
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-    <meta name="theme-color" content="#0b0d10" media="(prefers-color-scheme: dark)">
-    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#0b1010">
     <link rel="manifest" href="manifest.json">
     <link rel="icon" type="image/svg+xml" href="icon.svg">
     <link rel="apple-touch-icon" href="icon.svg">
@@ -42,28 +41,25 @@
                     connect.
                 </p>
 
-                <section class="chart-card">
-                    <svg id="sessionChart" viewBox="0 0 320 160" role="img" aria-label="Session speed, steps, and incline by minute"></svg>
+                <section class="control-deck" aria-label="Treadmill controls">
+                    <div class="slider-card">
+                        <div class="slider-row">
+                            <span class="slider-label">Target speed</span>
+                            <span class="slider-value"><span id="sliderValue">1.0</span><span id="sliderUnit"> kph</span></span>
+                        </div>
+                        <div class="slider-bumps">
+                            <button id="speedDownBtn" class="btn btn-bump" disabled aria-label="Speed down">−</button>
+                            <input type="range" id="speedSlider" min="1" max="6" step="0.1" value="1"
+                                   aria-label="Target speed" aria-valuetext="1.0 kph">
+                            <button id="speedUpBtn" class="btn btn-bump" disabled aria-label="Speed up">+</button>
+                        </div>
+                    </div>
+                    <div class="preset-row" id="presetRow" aria-label="Speed presets"></div>
+                    <div class="controls">
+                        <button id="startBtn" class="btn btn-go" data-action="start" disabled>Start</button>
+                        <button id="stopBtn" class="btn btn-stop" disabled>Stop</button>
+                    </div>
                 </section>
-
-                <div class="stats-grid" role="group" aria-label="Session totals">
-                    <div class="stat" data-tile="distance">
-                        <div class="stat-label">Distance</div>
-                        <div class="stat-value" id="distance">—</div>
-                    </div>
-                    <div class="stat" data-tile="calories">
-                        <div class="stat-label">Calories</div>
-                        <div class="stat-value" id="calories">—</div>
-                    </div>
-                    <div class="stat" data-tile="steps">
-                        <div class="stat-label">Steps</div>
-                        <div class="stat-value" id="steps">—</div>
-                    </div>
-                    <div class="stat" data-tile="duration">
-                        <div class="stat-label">Duration</div>
-                        <div class="stat-value" id="duration">—</div>
-                    </div>
-                </div>
 
                 <div class="settings">
                     <div class="setting">
@@ -86,25 +82,32 @@
                     </div>
                 </div>
 
-                <div class="slider-card">
-                    <div class="slider-row">
-                        <span class="slider-label">Target speed</span>
-                        <span class="slider-value"><span id="sliderValue">1.0</span><span id="sliderUnit"> kph</span></span>
+                <section class="session-section" aria-label="Session overview">
+                    <h2 class="section-title">Session overview</h2>
+                    <div class="stats-grid" role="group" aria-label="Session totals">
+                        <div class="stat" data-tile="distance">
+                            <div class="stat-label">Distance</div>
+                            <div class="stat-value" id="distance">—</div>
+                        </div>
+                        <div class="stat" data-tile="calories">
+                            <div class="stat-label">Calories</div>
+                            <div class="stat-value" id="calories">—</div>
+                        </div>
+                        <div class="stat" data-tile="steps">
+                            <div class="stat-label">Steps</div>
+                            <div class="stat-value" id="steps">—</div>
+                        </div>
+                        <div class="stat" data-tile="duration">
+                            <div class="stat-label">Duration</div>
+                            <div class="stat-value" id="duration">—</div>
+                        </div>
                     </div>
-                    <div class="slider-bumps">
-                        <button id="speedDownBtn" class="btn btn-bump" disabled aria-label="Speed down">−</button>
-                        <input type="range" id="speedSlider" min="1" max="6" step="0.1" value="1"
-                               aria-label="Target speed" aria-valuetext="1.0 kph">
-                        <button id="speedUpBtn" class="btn btn-bump" disabled aria-label="Speed up">+</button>
-                    </div>
-                </div>
-
-                <div class="preset-row" id="presetRow" aria-label="Speed presets"></div>
-
-                <div class="controls">
-                    <button id="startBtn" class="btn btn-go" disabled>Start</button>
-                    <button id="stopBtn" class="btn btn-stop" disabled>Stop</button>
-                </div>
+                    <section class="chart-card" aria-label="Session trend">
+                        <div class="chart-heading">Session trend</div>
+                        <svg id="sessionChart" viewBox="0 0 320 160" role="img" aria-label="Session speed, steps, and incline by minute"></svg>
+                        <div class="chart-legend" aria-hidden="true"><span class="legend-speed">Speed</span><span class="legend-steps">Steps</span><span class="legend-incline">Incline</span></div>
+                    </section>
+                </section>
             </section>
 
             <section id="history-panel" class="panel" role="tabpanel" aria-label="History">
