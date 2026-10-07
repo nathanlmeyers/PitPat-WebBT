@@ -15,7 +15,7 @@
 // with an older copy.
 // =============================================================================
 
-const CACHE_VERSION = 'v1';
+const CACHE_VERSION = 'v2';
 // Cache Storage is shared across the whole origin. On GitHub Pages that origin
 // hosts every other project too, so we only ever touch caches we named.
 const CACHE_PREFIX = 'pitpat-shell-';

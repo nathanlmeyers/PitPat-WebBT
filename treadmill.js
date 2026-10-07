@@ -8,6 +8,7 @@
 //   lib/protocol.js  — BLE UUIDs, notification decoding, command frames
 //   lib/units.js     — conversions, slider ranges, ACSM / stride math
 //   lib/sessions.js  — session sanitizing, merging, aggregation
+//   lib/incline.js   — motor-current grade detector + per-speed calibration
 //   lib/dates.js     — the slice of date-fns the calendar needed
 //
 // Sections in this file:
@@ -19,14 +20,21 @@
 //   6.  Session tracking
 //   7.  Display (dashboard, chart, slider, status)
 //   8.  History (calendar, day detail, import/export)
-//   9.  Wake lock
-//  10.  Wiring & init
+//   9.  Data tab (raw frame capture)
+//  10.  Wake lock
+//  11.  Wiring & init
 // =============================================================================
 
 import {
     SERVICE_UUID, NOTIFY_CHAR_UUID, WRITE_CHAR_UUID,
-    STATE, HEARTBEAT, decodeNotification, makePacket,
+    STATE, HEARTBEAT, FRAME_FIELDS,
+    decodeNotification, decodeExtended, toHex, makePacket, stepCounterDelta,
 } from './lib/protocol.js';
+
+import {
+    GradeDetector, MIN_DECISION_FRAMES,
+    cleanCalibration, learnSample, baselinesFor, speedBucket,
+} from './lib/incline.js';
 
 import {
     KM_PER_MI, LB_PER_KG, CM_PER_IN, FT_PER_M,
@@ -52,6 +60,8 @@ import {
 
 const PREF_UNIT    = 'treadmill_unit';
 const PREF_INCLINE = 'treadmill_incline';
+const PREF_INCLINE_AUTO = 'treadmill_incline_auto';
+const CALIBRATION_KEY = 'treadmill_calibration';
 const SESSIONS_KEY = 'treadmill_sessions';
 const PROFILE_KEY  = 'treadmill_profile';
 
@@ -88,6 +98,9 @@ const importHistoryInput = $('importHistoryInput');
 const toastEl            = $('toast');
 const unitToggles        = document.querySelectorAll('[data-role="unitToggle"]');
 const inclineToggle      = $('inclineToggle');
+const inclineStatus      = $('inclineStatus');
+const calibrationList    = $('calibrationList');
+const calibrationResetBtn = $('calibrationResetBtn');
 const calGrid            = $('calGrid');
 const calMonth           = $('calMonth');
 const prevMonthBtn       = $('prevMonthBtn');
@@ -112,14 +125,44 @@ const presetRow          = $('presetRow');
 const lifeDistance       = $('lifeDistance');
 const lifeClimb          = $('lifeClimb');
 const lifeSteps          = $('lifeSteps');
+const captureBtn         = $('captureBtn');
+const captureExportBtn   = $('captureExportBtn');
+const captureClearBtn    = $('captureClearBtn');
+const capFrames          = $('capFrames');
+const capElapsed         = $('capElapsed');
+const capRate            = $('capRate');
+const capBad             = $('capBad');
+const capFirmware        = $('capFirmware');
+const capLengths         = $('capLengths');
+const markerInput        = $('markerInput');
+const markerBtn          = $('markerBtn');
+const hexGrid            = $('hexGrid');
+const hexLegend          = $('hexLegend');
+const hexMeta            = $('hexMeta');
+const decodedTable       = $('decodedTable');
 const tabs   = document.querySelectorAll('.tab');
-const panels = { controls: $('controls-panel'), history: $('history-panel') };
+const panels = { controls: $('controls-panel'), history: $('history-panel'), data: $('data-panel') };
 
 
 // ---- 2. State -------------------------------------------------------------
 
 let unitMode    = localStorage.getItem(PREF_UNIT)    === 'mph' ? 'mph' : 'kph';
+/** Effective grade used for calories and climb: 0 or INCLINE_GRADE. In Auto
+ *  mode the detector writes it; otherwise the toggle does. */
 let inclineMode = localStorage.getItem(PREF_INCLINE) === String(INCLINE_GRADE) ? INCLINE_GRADE : 0;
+let inclineAuto = localStorage.getItem(PREF_INCLINE_AUTO) === '1';
+
+/** Motor-current baselines per speed bucket, learned while the toggle is
+ *  manual. See lib/incline.js. */
+let calibration = loadCalibration();
+let calibrationDirty = false;
+let lastCalibrationSaveAt = 0;
+const detector = new GradeDetector();
+
+/** Unwrapped motor-side step counter (bytes 43..44 are a u16 that wraps).
+ *  Firmware 37 leaves the classic steps field at zero, so this is the real
+ *  count on that hardware. */
+const hwSteps = { last: null, total: 0 };
 
 let device = null, server = null, notifyChar = null, writeChar = null;
 let connected = false;
@@ -165,6 +208,21 @@ let selectedDayKey = null;
 let profile = loadProfile();
 let wakeLock = null;
 let toastTimer = null;
+
+/** Raw-frame capture for the Data tab. In memory only; see section 9. */
+const CAPTURE_MAX_FRAMES = 20_000;      // ~5.5 h at 1 Hz
+const CAPTURE_CHURN_WINDOW = 30;        // frames over which per-byte changes are counted
+const capture = {
+    active: false,
+    startedAt: 0,
+    frames: [],        // { t, hex, len, inclineMode, unitMode, running_state, sessionDate }
+    markers: [],       // { t, text }
+    badChecksums: 0,
+    lengths: new Set(),
+    lastBytes: null,   // Uint8Array of the previous frame, for change highlighting
+    latest: null,      // { bytes, raw, ext } of the most recent frame
+    diffs: [],         // last CAPTURE_CHURN_WINDOW change masks (Uint8Array)
+};
 
 const bluetoothSupported = typeof navigator !== 'undefined' && !!navigator.bluetooth;
 
@@ -230,6 +288,32 @@ function loadProfile() {
 function saveProfile(p) {
     profile = p;
     localStorage.setItem(PROFILE_KEY, JSON.stringify(p));
+}
+
+function loadCalibration() {
+    try { return cleanCalibration(JSON.parse(localStorage.getItem(CALIBRATION_KEY) || 'null')); }
+    catch { return cleanCalibration(null); }
+}
+
+/** Write baselines through at most every PERSIST_INTERVAL_MS unless forced. */
+function persistCalibration({ force = false } = {}) {
+    if (!calibrationDirty) return;
+    const now = Date.now();
+    if (!force && now - lastCalibrationSaveAt < PERSIST_INTERVAL_MS) return;
+    lastCalibrationSaveAt = now;
+    calibrationDirty = false;
+    try { localStorage.setItem(CALIBRATION_KEY, JSON.stringify(calibration)); }
+    catch (err) { console.error('Could not save calibration:', err); }
+}
+
+function resetCalibration() {
+    calibration = cleanCalibration(null);
+    calibrationDirty = true;
+    persistCalibration({ force: true });
+    detector.reset();
+    renderCalibrationList();
+    renderInclineStatus();
+    showToast('Calibration cleared');
 }
 
 
@@ -350,16 +434,73 @@ function cancelReconnect() {
 }
 
 function handleNotification(event) {
-    const raw = decodeNotification(event.target.value);
+    const value = event.target.value;
+    if (capture.active) recordFrame(value);
+    const raw = decodeNotification(value);
     if (!raw) {
         // Runt frame — treat as "no reliable data" but don't tear down a live
         // session over one bad packet; the next tick usually recovers.
         return;
     }
+    const ext = decodeExtended(value);
+    resolveSteps(raw, ext);
+    updateIncline(raw, ext);
     trackSession(raw);
     updateDashboard();
     updateRunningState(raw.running_state);
     sendQueuedOrHeartbeat();
+}
+
+/**
+ * Pick the step count the dashboard should trust and write it back into
+ * `raw.steps`, tagging where it came from. Order: the classic field when the
+ * firmware fills it, else the motor-side u16 counter (unwrapped), else none —
+ * in which case the session falls back to the height-based estimate.
+ */
+function resolveSteps(raw, ext) {
+    if (raw.steps > 0) { raw.stepSource = 'firmware'; return; }
+    const c = ext && ext.kind === 'diagnostics' ? ext.real_electricity_steps : undefined;
+    if (c == null) { raw.stepSource = 'none'; return; }
+    if (hwSteps.last == null) hwSteps.total = c;
+    else hwSteps.total += stepCounterDelta(hwSteps.last, c);
+    hwSteps.last = c;
+    raw.steps = hwSteps.total;
+    raw.stepSource = 'motor';
+}
+
+/**
+ * Feed the grade detector. In manual mode every settled frame teaches the
+ * baseline for (speed, toggle); in Auto mode the window is classified against
+ * the learned baselines and the effective grade follows the decision.
+ */
+function updateIncline(raw, ext) {
+    const current = ext && ext.kind === 'diagnostics' && ext.real_electricity != null
+        ? ext.real_electricity : NaN;
+    const settled = detector.push({
+        running: raw.running_state === STATE.RUNNING,
+        speed: raw.current_speed,
+        target: raw.target_speed,
+        current,
+    });
+    const kph = rawKph(raw);
+    if (settled && !inclineAuto) {
+        learnSample(calibration, kph, inclineMode, current);
+        calibrationDirty = true;
+        persistCalibration();
+    }
+    if (inclineAuto) {
+        const decision = detector.evaluate(baselinesFor(calibration, kph));
+        if (decision !== null && decision !== inclineMode) applyDetectedIncline(decision);
+    }
+    renderInclineStatus(kph);
+}
+
+function applyDetectedIncline(grade) {
+    inclineMode = grade;
+    localStorage.setItem(PREF_INCLINE, String(inclineMode));
+    if (capture.active) addMarker(`auto incline → ${inclineMode}%`);
+    showToast(`Incline detected: ${inclineMode}%`);
+    updateDashboard();
 }
 
 function sendQueuedOrHeartbeat() {
@@ -391,6 +532,7 @@ function trackSession(raw) {
             prevDuration: raw.duration,
             speedSum: raw.current_speed, speedCount: 1,
             estKcal: 0, estSteps: 0,
+            stepSource: raw.stepSource || 'none',
             samples: [],
         };
         lastFinished = null;
@@ -418,6 +560,7 @@ function trackSession(raw) {
         session.prevDuration = raw.duration;
         session.speedSum += raw.current_speed;
         session.speedCount += 1;
+        if (raw.stepSource && raw.stepSource !== 'none') session.stepSource = raw.stepSource;
         recordSample(raw);
         persistSession();
         return;
@@ -483,7 +626,10 @@ function sessionTotals() {
     return {
         duration:   delta('duration'),
         distanceKm: delta('distance') / 1000,
-        steps:      profile.heightCm != null ? Math.round(s.estSteps) : delta('steps'),
+        // The treadmill's own count wins when it has one; the height-based
+        // estimate exists only for hardware that reports nothing.
+        steps:      (s.stepSource && s.stepSource !== 'none') || profile.heightCm == null
+                        ? delta('steps') : Math.round(s.estSteps),
         calories:   profile.weightKg != null ? Math.round(s.estKcal) : adjustCalories(delta('calories')),
         rawCalories: delta('calories'),
         avgKph:     (s.speedSum / s.speedCount) / 1000,
@@ -545,6 +691,7 @@ function finishSession() {
 
     session = null;
     lastPersistAt = 0;
+    persistCalibration({ force: true });
     releaseWakeLock();
     markHistoryDirty();
     updateDashboard();
@@ -728,6 +875,7 @@ function updateRunningState(state) {
 
     if (state === STATE.RUNNING) requestWakeLock();
     else releaseWakeLock();
+    if (state !== STATE.RUNNING) renderInclineStatus();
 }
 
 function applyUnitToSlider() {
@@ -769,6 +917,7 @@ function setUnit(newUnit) {
     if (newUnit === unitMode) return;
     unitMode = newUnit;
     localStorage.setItem(PREF_UNIT, unitMode);
+    if (capture.active) addMarker(`unit → ${unitMode}`);
     syncUnitToggles();
     // curTargetSpeed is in native units (unit-independent); only the
     // slider/readout presentation changes — the physical target is unchanged,
@@ -778,14 +927,79 @@ function setUnit(newUnit) {
     flushHistoryRender();
 }
 
-function setIncline(newIncline) {
-    const n = Number(newIncline) === INCLINE_GRADE ? INCLINE_GRADE : 0;
-    if (n === inclineMode) return;
-    inclineMode = n;
-    localStorage.setItem(PREF_INCLINE, String(inclineMode));
-    updateSegmentedActive(inclineToggle, String(inclineMode));
+/** '0' | '7' | 'auto'. A manual pick is also the label the calibration
+ *  learns from, so it must reflect where the deck really is. */
+function setIncline(value) {
+    if (value === 'auto') {
+        if (inclineAuto) return;
+        inclineAuto = true;
+        localStorage.setItem(PREF_INCLINE_AUTO, '1');
+        if (capture.active) addMarker('incline → auto');
+    } else {
+        const n = Number(value) === INCLINE_GRADE ? INCLINE_GRADE : 0;
+        const wasAuto = inclineAuto;
+        inclineAuto = false;
+        localStorage.setItem(PREF_INCLINE_AUTO, '0');
+        if (n === inclineMode && !wasAuto) return;
+        inclineMode = n;
+        localStorage.setItem(PREF_INCLINE, String(inclineMode));
+        if (capture.active) addMarker(`incline → ${inclineMode}%`);
+    }
+    syncInclineToggle();
+    renderInclineStatus();
     updateDashboard();
     flushHistoryRender();
+}
+
+function syncInclineToggle() {
+    updateSegmentedActive(inclineToggle, inclineAuto ? 'auto' : String(inclineMode));
+}
+
+/** One-line status under the Incline label. */
+function renderInclineStatus(kph) {
+    const running = connected && runningState === STATE.RUNNING;
+    let text = '';
+    if (inclineAuto) {
+        if (!running || kph == null) {
+            text = `Auto · using ${inclineMode}%`;
+        } else {
+            const b = baselinesFor(calibration, kph);
+            if (!b)                                     text = `Auto · not calibrated at ${speedBucket(kph)} kph`;
+            else if (detector.count < MIN_DECISION_FRAMES) text = detector.decision === null
+                                                            ? 'Auto · listening…' : `Auto · ${inclineMode}% (listening…)`;
+            else                                        text = `Auto · ${inclineMode}% detected`;
+        }
+    } else if (running && kph != null) {
+        const b = calibration.buckets[speedBucket(kph)]?.[String(inclineMode)];
+        text = b ? `Learning ${inclineMode}% at ${speedBucket(kph)} kph · ${b.n} samples` : '';
+    }
+    if (inclineStatus.textContent !== text) inclineStatus.textContent = text;
+}
+
+function renderCalibrationList() {
+    calibrationList.replaceChildren();
+    const keys = Object.keys(calibration.buckets).sort((a, b) => Number(a) - Number(b));
+    if (keys.length === 0) {
+        const d = document.createElement('div');
+        d.className = 'cal-empty';
+        d.textContent = 'Nothing learned yet.';
+        calibrationList.appendChild(d);
+        return;
+    }
+    for (const key of keys) {
+        const b = calibration.buckets[key];
+        const row = document.createElement('div');
+        const speed = document.createElement('span');
+        speed.className = 'cal-speed';
+        speed.textContent = `${key} kph`;
+        const vals = document.createElement('span');
+        vals.className = 'cal-vals';
+        const part = g => b[g] ? `${g}%: ${b[g].mean.toFixed(1)} (${b[g].n})` : `${g}%: —`;
+        vals.textContent = `${part('0')}  ${part(String(INCLINE_GRADE))}`;
+        if (baselinesFor(calibration, Number(key))?.bucket === key) vals.classList.add('cal-ok');
+        row.append(speed, vals);
+        calibrationList.appendChild(row);
+    }
 }
 
 function updateSegmentedActive(group, value) {
@@ -992,7 +1206,318 @@ function importHistory(file) {
 }
 
 
-// ---- 9. Wake lock ---------------------------------------------------------
+// ---- 9. Data tab (raw frame capture) --------------------------------------
+//
+// Records every notification byte-for-byte, with the user's incline and unit
+// settings as labels, so the stream can be studied offline (see
+// tools/analyze-capture.mjs). Nothing here sends anything to the treadmill,
+// and nothing is persisted — export before closing the tab.
+
+function isDataVisible() {
+    return panels.data.classList.contains('is-active');
+}
+
+function recordFrame(value) {
+    if (capture.frames.length >= CAPTURE_MAX_FRAMES) {
+        capture.active = false;
+        showToast('Capture full — recording stopped. Export it.');
+        renderCaptureControls();
+        return;
+    }
+    const bytes = new Uint8Array(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
+    const raw = decodeNotification(value);
+    const ext = raw ? decodeExtended(value) : null;
+
+    capture.frames.push({
+        t: Date.now(),
+        hex: toHex(value),
+        len: bytes.length,
+        inclineMode,
+        unitMode,
+        running_state: raw ? raw.running_state : null,
+        sessionDate: session ? session.date : null,
+    });
+    capture.lengths.add(bytes.length);
+    if (raw && !raw.checksum_ok) capture.badChecksums++;
+
+    // Change mask against the previous frame, kept for the churn badges.
+    const prev = capture.lastBytes;
+    const n = Math.max(bytes.length, prev ? prev.length : 0);
+    const mask = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+        const a = i < bytes.length ? bytes[i] : -1;
+        const b = prev && i < prev.length ? prev[i] : -1;
+        mask[i] = (prev && a !== b) ? 1 : 0;
+    }
+    capture.diffs.push(mask);
+    if (capture.diffs.length > CAPTURE_CHURN_WINDOW) capture.diffs.shift();
+    capture.lastBytes = bytes;
+    capture.latest = { bytes, raw, ext, mask };
+
+    if (isDataVisible()) renderCapture();
+}
+
+function addMarker(text) {
+    const t = (text || '').trim();
+    if (!t) return;
+    capture.markers.push({ t: Date.now(), text: t, frameIndex: capture.frames.length });
+    showToast(`Marked: ${t}`);
+}
+
+function toggleCapture() {
+    if (capture.active) {
+        capture.active = false;
+        showToast('Recording stopped');
+    } else {
+        if (capture.frames.length === 0) capture.startedAt = Date.now();
+        capture.active = true;
+        showToast(connected ? 'Recording raw frames' : 'Recording — connect to the treadmill to receive frames');
+    }
+    renderCaptureControls();
+}
+
+function clearCapture() {
+    capture.active = false;
+    capture.startedAt = 0;
+    capture.frames = [];
+    capture.markers = [];
+    capture.badChecksums = 0;
+    capture.lengths = new Set();
+    capture.lastBytes = null;
+    capture.latest = null;
+    capture.diffs = [];
+    renderCapture();
+}
+
+/** Re-decode every frame from its hex so the export carries both the bytes
+ *  and our current reading of them, and the analysis script can re-check. */
+function exportCapture() {
+    const fromHex = hex => {
+        const parts = hex.split(' ');
+        const a = new Uint8Array(parts.length);
+        for (let i = 0; i < parts.length; i++) a[i] = parseInt(parts[i], 16);
+        return new DataView(a.buffer);
+    };
+    let device = null;
+    for (let i = capture.frames.length - 1; i >= 0 && !device; i--) {
+        const v = fromHex(capture.frames[i].hex);
+        const raw = decodeNotification(v);
+        if (!raw) continue;
+        device = { firmware: raw.firmware, device_type: raw.device_type,
+                   max_speed: raw.max_speed, max_incline: raw.max_incline };
+    }
+    for (const f of capture.frames) {
+        const v = fromHex(f.hex);
+        const ext = decodeExtended(v);
+        if (ext && ext.kind === 'identity' && device) { device.serial = ext.serial; break; }
+    }
+    const frames = capture.frames.map(f => {
+        const v = fromHex(f.hex);
+        return { ...f, decoded: decodeNotification(v), extended: decodeExtended(v) };
+    });
+    const payload = {
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        device,
+        profile: { heightCm: profile.heightCm, weightKg: profile.weightKg },
+        frames,
+        markers: capture.markers,
+    };
+    const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `treadmill_capture_${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
+    showToast(`Exported ${frames.length} frames`);
+}
+
+function renderCaptureControls() {
+    captureBtn.textContent = capture.active ? 'Stop' : (capture.frames.length ? 'Resume' : 'Record');
+    captureBtn.classList.toggle('is-recording', capture.active);
+    captureExportBtn.disabled = capture.frames.length === 0;
+    captureClearBtn.disabled  = capture.frames.length === 0 && capture.markers.length === 0;
+    markerInput.disabled = !capture.active;
+    markerBtn.disabled   = !capture.active;
+}
+
+/** Median interval of the last 60 frames, as a rate. */
+function captureRateHz() {
+    const f = capture.frames;
+    if (f.length < 3) return null;
+    const start = Math.max(1, f.length - 60);
+    const gaps = [];
+    for (let i = start; i < f.length; i++) gaps.push(f[i].t - f[i - 1].t);
+    gaps.sort((a, b) => a - b);
+    const median = gaps[Math.floor(gaps.length / 2)];
+    return median > 0 ? 1000 / median : null;
+}
+
+function renderCapture() {
+    renderCaptureControls();
+
+    const n = capture.frames.length;
+    capFrames.textContent = String(n);
+    capElapsed.textContent = n && capture.startedAt
+        ? formatDuration((capture.frames[n - 1].t - capture.startedAt) / 1000) : '—';
+    const hz = captureRateHz();
+    capRate.textContent = hz ? `${hz.toFixed(1)} Hz` : '—';
+    capBad.textContent = String(capture.badChecksums);
+    const latestRaw = capture.latest?.raw;
+    capFirmware.textContent = latestRaw ? String(latestRaw.firmware) : '—';
+    capLengths.textContent = capture.lengths.size
+        ? [...capture.lengths].sort((a, b) => a - b).join(', ') : '—';
+
+    renderHexGrid();
+    renderDecoded();
+}
+
+/** Field index → tint class; unnamed bytes get none. */
+function fieldClassFor(offset) {
+    for (let i = 0; i < FRAME_FIELDS.length; i++) {
+        const f = FRAME_FIELDS[i];
+        if (offset >= f.offset && offset < f.offset + f.length) return `f${i % 8}`;
+    }
+    return '';
+}
+
+function renderHexGrid() {
+    const latest = capture.latest;
+    if (!latest) {
+        hexGrid.replaceChildren(emptyNote('No frames yet.'));
+        hexLegend.replaceChildren();
+        hexMeta.textContent = '';
+        return;
+    }
+    const { bytes, mask } = latest;
+    const churn = new Uint32Array(bytes.length);
+    for (const d of capture.diffs) {
+        for (let i = 0; i < d.length && i < bytes.length; i++) churn[i] += d[i];
+    }
+
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < bytes.length; i++) {
+        const cell = document.createElement('div');
+        cell.className = 'hex-cell ' + fieldClassFor(i) + (mask[i] ? ' is-changed' : '');
+        const off = document.createElement('span');
+        off.className = 'off';
+        off.textContent = String(i);
+        cell.append(off, bytes[i].toString(16).padStart(2, '0').toUpperCase());
+        if (churn[i] > 0) {
+            const b = document.createElement('span');
+            b.className = 'churn';
+            b.textContent = String(churn[i]);
+            cell.appendChild(b);
+        }
+        const field = FRAME_FIELDS.find(f => i >= f.offset && i < f.offset + f.length);
+        cell.title = field ? `${i}: ${field.name}` : `${i}: (unnamed)`;
+        frag.appendChild(cell);
+    }
+    hexGrid.replaceChildren(frag);
+    hexMeta.textContent = `${bytes.length} bytes`;
+
+    // Legend, once per render (cheap), only for fields present in this frame.
+    const legend = document.createDocumentFragment();
+    FRAME_FIELDS.forEach((f, i) => {
+        if (f.offset >= bytes.length) return;
+        const s = document.createElement('span');
+        s.className = `f${i % 8}`;
+        s.textContent = `${f.offset}${f.length > 1 ? '–' + (f.offset + f.length - 1) : ''} ${f.name}`;
+        legend.appendChild(s);
+    });
+    hexLegend.replaceChildren(legend);
+}
+
+const DECODED_GROUPS = [
+    ['Belt', ['running_state', 'current_speed', 'target_speed', 'max_speed', 'run_walk_state']],
+    ['Counters', ['distance', 'steps', 'calories', 'duration', 'cycle_id']],
+    ['Incline', ['incline', 'target_incline', 'max_incline']],
+    ['Device', ['firmware', 'device_type', 'heart_rate', 'reported_unit', 'wifi_connected', 'has_bracelet', 'frame_len', 'checksum_ok']],
+];
+const STATE_NAMES = ['starting', 'running', 'paused', 'stopped'];
+
+function renderDecoded() {
+    const latest = capture.latest;
+    if (!latest || !latest.raw) {
+        decodedTable.replaceChildren(emptyNote(latest ? 'Frame too short to decode.' : 'No frames yet.'));
+        return;
+    }
+    const { raw, ext } = latest;
+    const frag = document.createDocumentFragment();
+    const row = (k, v) => {
+        const wrap = document.createElement('div');
+        const dt = document.createElement('dt'); dt.textContent = k;
+        const dd = document.createElement('dd'); dd.textContent = String(v);
+        wrap.append(dt, dd);
+        frag.appendChild(wrap);
+    };
+    const group = label => {
+        const g = document.createElement('div');
+        g.className = 'group';
+        g.textContent = label;
+        frag.appendChild(g);
+    };
+    const fmt = (k, v) => {
+        if (k === 'running_state') return `${v} (${STATE_NAMES[v] ?? '?'})`;
+        if (k === 'current_speed' || k === 'target_speed' || k === 'max_speed') return `${v} (${(v / 1000).toFixed(2)} kph)`;
+        if (k === 'duration') return `${v} s`;
+        if (k === 'distance') return `${v} m`;
+        return v;
+    };
+    for (const [label, keys] of DECODED_GROUPS) {
+        group(label);
+        for (const k of keys) row(k, fmt(k, raw[k]));
+    }
+    group(ext ? `Extended (${ext.kind})` : 'Extended');
+    if (!ext) {
+        row('tail', 'none (bare frame)');
+    } else {
+        for (const [k, v] of Object.entries(ext)) if (k !== 'kind') row(k, v);
+    }
+    group('Grade detector');
+    row('mode', inclineAuto ? 'auto' : 'manual');
+    row('effective_grade', `${inclineMode}%`);
+    row('window', `${detector.count} frames`);
+    row('window_mean', Number.isFinite(detector.windowMean) ? detector.windowMean.toFixed(1) : '—');
+    const b = baselinesFor(calibration, raw.current_speed / 1000);
+    row('baselines', b ? `0%: ${b.flat.mean.toFixed(1)}  ${INCLINE_GRADE}%: ${b.grade.mean.toFixed(1)} @ ${b.bucket} kph` : 'none for this speed');
+    row('decision', detector.decision === null ? '—' : `${detector.decision}%`);
+    row('step_source', raw.stepSource || '—');
+    decodedTable.replaceChildren(frag);
+}
+
+function emptyNote(text) {
+    const p = document.createElement('div');
+    p.className = 'data-empty';
+    p.textContent = text;
+    return p;
+}
+
+/** Dev hook: feed a hex frame ("68 34 00 …") into the recorder without a
+ *  treadmill, e.g. from the console while styling the Data tab. Only the
+ *  capture sees it — no session, dashboard, or command side effects. */
+window.__pitpat = {
+    /** `full: true` runs the frame through the whole notification path
+     *  (session, steps, incline) as if the treadmill had sent it. */
+    injectFrame(hex, { full = false } = {}) {
+        const parts = hex.trim().split(/\s+/);
+        const a = new Uint8Array(parts.length);
+        for (let i = 0; i < parts.length; i++) a[i] = parseInt(parts[i], 16);
+        const value = new DataView(a.buffer);
+        if (full) handleNotification({ target: { value } });
+        else if (capture.active) recordFrame(value);
+    },
+    state() {
+        return { inclineMode, inclineAuto, detector: { count: detector.count, mean: detector.windowMean, decision: detector.decision },
+                 calibration: JSON.parse(JSON.stringify(calibration)), steps: sessionTotals()?.steps ?? null,
+                 stepSource: (session || lastFinished)?.stepSource ?? null };
+    },
+};
+
+
+// ---- 10. Wake lock --------------------------------------------------------
 
 /** Keep the screen on while the belt is moving — otherwise the dashboard
  *  blanks mid-walk and you have to reach over and tap it. */
@@ -1021,7 +1546,7 @@ document.addEventListener('visibilitychange', () => {
 });
 
 
-// ---- 10. Wiring & init ----------------------------------------------------
+// ---- 11. Wiring & init ----------------------------------------------------
 
 function wireSegmented(group, onChange) {
     group.addEventListener('click', e => {
@@ -1109,6 +1634,7 @@ function openSettings() {
     heightInput.value = profile.heightCm == null ? ''
         : round1(modalHeightUnit === 'in' ? profile.heightCm / CM_PER_IN : profile.heightCm);
     for (const k in tileChecks) tileChecks[k].checked = profile.tiles[k];
+    renderCalibrationList();
     focusBeforeModal = document.activeElement;
     settingsModal.hidden = false;
     weightInput.focus();
@@ -1266,6 +1792,7 @@ settingsSaveBtn.addEventListener('click', saveSettings);
 settingsModal.addEventListener('click', e => { if (e.target === settingsModal) closeSettings(); });
 wireSegmented(weightUnitToggle, setModalWeightUnit);
 wireSegmented(heightUnitToggle, setModalHeightUnit);
+calibrationResetBtn.addEventListener('click', resetCalibration);
 
 // Tabs
 tabs.forEach(t => t.addEventListener('click', () => {
@@ -1277,7 +1804,21 @@ tabs.forEach(t => t.addEventListener('click', () => {
     Object.entries(panels).forEach(([k, p]) => p.classList.toggle('is-active', k === t.dataset.tab));
     // Only rebuild if something changed while the tab was hidden.
     if (t.dataset.tab === 'history' && historyDirty) flushHistoryRender();
+    if (t.dataset.tab === 'data') renderCapture();
 }));
+
+// Data tab
+captureBtn.addEventListener('click', toggleCapture);
+captureExportBtn.addEventListener('click', exportCapture);
+captureClearBtn.addEventListener('click', clearCapture);
+markerBtn.addEventListener('click', () => {
+    addMarker(markerInput.value);
+    markerInput.value = '';
+    renderCaptureControls();
+});
+markerInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); markerBtn.click(); }
+});
 
 // Calendar navigation
 prevMonthBtn.addEventListener('click', () => navigateMonth(-1));
@@ -1296,7 +1837,10 @@ window.addEventListener('resize', renderChart);
 
 // Persistence is throttled during a session, so make sure the last few seconds
 // aren't lost when the tab goes away.
-window.addEventListener('pagehide', () => { if (session) writeSessionRecord(); });
+window.addEventListener('pagehide', () => {
+    if (session) writeSessionRecord();
+    persistCalibration({ force: true });
+});
 
 // Offline shell. Nothing here needs the network at runtime, so the installed
 // PWA shouldn't fall over when the network is down.
@@ -1309,12 +1853,14 @@ if ('serviceWorker' in navigator) {
 
 // Init
 syncUnitToggles();
-updateSegmentedActive(inclineToggle, String(inclineMode));
+syncInclineToggle();
+renderInclineStatus();
 applyTileVisibility();
 applyUnitToSlider();   // also renders presets
 updateDashboard();     // also draws the empty chart
 updateRunningState(STATE.STOPPED);
 renderCalendar();      // also renders lifetime totals
+renderCapture();       // empty Data tab state
 
 if (!bluetoothSupported) {
     // Without this the Connect button throws a TypeError deep inside

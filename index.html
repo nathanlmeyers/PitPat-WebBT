@@ -22,6 +22,7 @@
             <nav class="tabs" role="tablist" aria-label="Views">
                 <button class="tab is-active" data-tab="controls" role="tab" aria-selected="true" aria-controls="controls-panel">Controls</button>
                 <button class="tab" data-tab="history" role="tab" aria-selected="false" aria-controls="history-panel">History</button>
+                <button class="tab" data-tab="data" role="tab" aria-selected="false" aria-controls="data-panel">Data</button>
             </nav>
         </header>
 
@@ -73,10 +74,14 @@
                         </div>
                     </div>
                     <div class="setting">
-                        <span class="setting-label">Incline</span>
+                        <div class="setting-text">
+                            <span class="setting-label">Incline</span>
+                            <span class="setting-sub" id="inclineStatus" aria-live="polite"></span>
+                        </div>
                         <div class="segmented" id="inclineToggle" role="group" aria-label="Incline">
                             <button class="seg is-active" data-value="0" type="button" aria-pressed="true">0%</button>
                             <button class="seg" data-value="7" type="button" aria-pressed="false">7%</button>
+                            <button class="seg" data-value="auto" type="button" aria-pressed="false">Auto</button>
                         </div>
                     </div>
                 </div>
@@ -141,6 +146,42 @@
                 </div>
                 <div class="day-detail" id="dayDetail" hidden></div>
             </section>
+
+            <section id="data-panel" class="panel" role="tabpanel" aria-label="Data">
+                <p class="data-hint">
+                    Records every raw frame the treadmill sends, labelled with your incline
+                    and unit settings. Nothing leaves the browser. The capture lives in memory
+                    only, so export it before closing the tab.
+                </p>
+                <div class="data-actions">
+                    <button id="captureBtn" class="btn btn-primary">Record</button>
+                    <button id="captureExportBtn" class="btn btn-ghost" disabled>Export</button>
+                    <button id="captureClearBtn" class="btn btn-ghost" disabled>Clear</button>
+                </div>
+                <div class="data-stats" role="group" aria-label="Capture status">
+                    <div class="stat"><div class="stat-label">Frames</div><div class="stat-value" id="capFrames">0</div></div>
+                    <div class="stat"><div class="stat-label">Elapsed</div><div class="stat-value" id="capElapsed">—</div></div>
+                    <div class="stat"><div class="stat-label">Rate</div><div class="stat-value" id="capRate">—</div></div>
+                    <div class="stat"><div class="stat-label">Bad checksum</div><div class="stat-value" id="capBad">0</div></div>
+                    <div class="stat"><div class="stat-label">Firmware</div><div class="stat-value" id="capFirmware">—</div></div>
+                    <div class="stat"><div class="stat-label">Lengths</div><div class="stat-value" id="capLengths">—</div></div>
+                </div>
+                <div class="marker-row">
+                    <input type="text" id="markerInput" class="field-input" maxlength="80"
+                           placeholder="Marker, e.g. counted 100 steps" aria-label="Marker text" disabled>
+                    <button id="markerBtn" class="btn btn-ghost" disabled>Mark</button>
+                </div>
+                <section class="data-card">
+                    <div class="data-card-title">Latest frame <span class="data-card-sub" id="hexMeta"></span></div>
+                    <div id="hexGrid" class="hex-grid" aria-label="Latest frame bytes"></div>
+                    <div id="hexLegend" class="hex-legend"></div>
+                    <p class="data-footnote">Bold = changed since the previous frame. Badge = changes in the last 30 frames.</p>
+                </section>
+                <section class="data-card">
+                    <div class="data-card-title">Decoded</div>
+                    <dl id="decodedTable" class="decoded"></dl>
+                </section>
+            </section>
         </main>
     </div>
 
@@ -153,7 +194,7 @@
     <div id="settingsModal" class="overlay" hidden>
         <div class="modal-card" role="dialog" aria-modal="true" aria-label="Settings">
             <h2 class="modal-title">Settings</h2>
-            <p class="modal-hint">Used for calorie &amp; step estimates. Until set, the treadmill's own numbers are shown.</p>
+            <p class="modal-hint">Weight drives the calorie estimate. Height is only used for steps when the treadmill doesn't report its own count.</p>
 
             <label class="field-label" for="weightInput">Weight</label>
             <div class="field-row">
@@ -180,6 +221,11 @@
                 <label><input type="checkbox" id="tileSteps" checked> Steps</label>
                 <label><input type="checkbox" id="tileDuration" checked> Duration</label>
             </div>
+
+            <span class="field-label">Incline calibration</span>
+            <p class="modal-hint">Auto incline learns the motor load at each speed while the toggle is set by hand. Walk 30 s or more at your usual speed on 0% and again on 7%, then switch to Auto.</p>
+            <div id="calibrationList" class="calibration-list"></div>
+            <button id="calibrationResetBtn" class="btn btn-ghost btn-small" type="button">Reset calibration</button>
 
             <div class="modal-actions">
                 <button id="settingsCancelBtn" class="btn btn-ghost" type="button">Cancel</button>
