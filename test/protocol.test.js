@@ -2,7 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-    BLE, STATE, USER_ID_BYTES, decodeNotification, makePacket,
+    BLE, STATE, USER_ID_BYTES, FRAME_FIELDS,
+    decodeNotification, decodeExtended, verifyChecksum, toHex, makePacket,
+    stepCounterDelta,
 } from '../lib/protocol.js';
 
 /** Build a notification frame with raw bytes written by hand, so the test
@@ -113,4 +115,176 @@ test('makePacket sets the unit bit without touching the speed value', () => {
     let xor = 0;
     for (let i = 1; i <= 21; i++) xor ^= mph[i];
     assert.equal(xor, 0, 'checksum must still be valid with the unit bit set');
+});
+
+// ---- Full-frame decoding ---------------------------------------------------
+
+/** Parse "68 34 00 …" / "683400…" into a DataView. */
+function fromHex(hex) {
+    const clean = hex.replace(/\s+/g, '');
+    const a = new Uint8Array(clean.length / 2);
+    for (let i = 0; i < a.length; i++) a[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+    return new DataView(a.buffer);
+}
+
+/** Seal a hand-built frame: write the declared length, checksum, terminator. */
+function seal(bytes) {
+    bytes[1] = bytes.length;
+    let xor = 0;
+    for (let i = 1; i <= bytes.length - 3; i++) xor ^= bytes[i];
+    bytes[bytes.length - 2] = xor;
+    bytes[bytes.length - 1] = BLE.END_BYTE;
+    return new DataView(bytes.buffer);
+}
+
+// The one published real capture (azmke/pitpat-treadmill-control, idle
+// treadmill, 52 bytes). Firmware 27, max speed 6.0 kph, device type 5,
+// serial "tlKa191fUpTss603", checksum 0x40.
+const REAL_IDLE_FRAME =
+    '68 34 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ' +
+    '2a 1b 00 17 70 00 05 00 74 6c 4b 61 31 39 31 66 55 70 54 73 73 36 30 33 ' +
+    '0e 00 40 43';
+
+test('decodeNotification decodes the published 52-byte real capture', () => {
+    const view = fromHex(REAL_IDLE_FRAME);
+    assert.equal(view.byteLength, 52);
+    const raw = decodeNotification(view);
+
+    assert.equal(raw.frame_len, 52);
+    assert.equal(raw.firmware, 27);
+    assert.equal(raw.cycle_id, 0x2a);
+    assert.equal(raw.max_speed, 6000);
+    assert.equal(raw.max_incline, 0);
+    assert.equal(raw.device_type, 5);
+    assert.equal(raw.running_state, STATE.STOPPED);
+    assert.equal(raw.incline, 0);
+    assert.equal(raw.heart_rate, 0);
+    assert.equal(raw.wifi_connected, false);
+    assert.equal(raw.checksum_ok, true);
+    assert.equal(verifyChecksum(view), true);
+});
+
+test('decodeExtended reads the identity tail on a ≥52-byte frame', () => {
+    const ext = decodeExtended(fromHex(REAL_IDLE_FRAME));
+    assert.equal(ext.kind, 'identity');
+    assert.equal(ext.serial, 'tlKa191fUpTss603');
+    assert.equal(ext.ble_model, 0x0e);
+    assert.equal(ext.ble_brand, 0);
+    assert.equal(ext.bracelet_power, true);   // byte 31 = 0 ≤ 15
+});
+
+test('decodeExtended reads the diagnostics tail on a shorter fw≥25 frame', () => {
+    const a = new Uint8Array(50);
+    a[25] = 27;                       // firmware
+    a[32] = 7;                        // carrying_idler
+    a[33] = 2;                        // sensor_status
+    a[34] = 0x80; a[35] = 0x0A;       // peak: sign bit set → 65535 − 0x800A
+    a[36] = 0x01; a[37] = 0x2C;       // grain 300
+    a[38] = 0x00; a[39] = 0x64;       // sum_steps 100
+    a[40] = 55;                       // real_electricity
+    a[41] = 0x04; a[42] = 0xB0;       // real_rotate 1200
+    a[43] = 0x00; a[44] = 0x63;       // real_electricity_steps 99
+    a[45] = 88;                       // battery
+    a[46] = 1;                        // remote_states
+    a[47] = 0b00000101;               // buzzer on, factory_rc 0, device_activate 1
+    const view = seal(a);
+
+    const ext = decodeExtended(view);
+    assert.equal(ext.kind, 'diagnostics');
+    assert.equal(ext.carrying_idler, 7);
+    assert.equal(ext.sensor_status, 2);
+    assert.equal(ext.peak, 65535 - 0x800A);
+    assert.equal(ext.grain, 300);
+    assert.equal(ext.sum_steps, 100);
+    assert.equal(ext.real_electricity, 55);
+    assert.equal(ext.real_rotate, 1200);
+    assert.equal(ext.real_electricity_steps, 99);
+    assert.equal(ext.battery, 88);
+    assert.equal(ext.remote_states, 1);
+    assert.equal(ext.buzzer_on, true);
+    assert.equal(ext.factory_rc, 0);
+    assert.equal(ext.device_activate, 1);
+    assert.equal(decodeNotification(view).checksum_ok, true);
+});
+
+test('decodeExtended returns null for a bare 31-byte frame', () => {
+    const a = new Uint8Array(31);
+    a[25] = 27;
+    assert.equal(decodeExtended(seal(a)), null);
+});
+
+test('a bad checksum is reported, not rejected', () => {
+    const a = new Uint8Array(31);
+    a[25] = 27;
+    a[3] = 0x0D; a[4] = 0xAC;        // 3500
+    seal(a);
+    a[a.length - 2] ^= 0xFF;          // corrupt it
+    const raw = decodeNotification(new DataView(a.buffer));
+    assert.ok(raw, 'frame still decodes');
+    assert.equal(raw.current_speed, 3500);
+    assert.equal(raw.checksum_ok, false);
+});
+
+test('decodeNotification decodes the mid-frame fields the dashboard ignores', () => {
+    const a = new Uint8Array(31);
+    a[5] = 0x0B; a[6] = 0xB8;         // target speed 3000
+    a[11] = 7;                        // incline
+    a[12] = 0b10000011;               // target_incline 3, run_walk_state 2
+    a[13] = 120;                      // heart rate
+    a[26] = BLE.FLAG_STATE_RUNNING | BLE.FLAG_WIFI;   // bracelet bits 0 → present
+    const raw = decodeNotification(seal(a));
+    assert.equal(raw.target_speed, 3000);
+    assert.equal(raw.incline, 7);
+    assert.equal(raw.target_incline, 3);
+    assert.equal(raw.run_walk_state, 2);
+    assert.equal(raw.heart_rate, 120);
+    assert.equal(raw.wifi_connected, true);
+    assert.equal(raw.has_bracelet, true);
+    assert.equal(raw.running_state, STATE.RUNNING);
+});
+
+test('toHex round-trips and FRAME_FIELDS covers the documented bytes without overlap', () => {
+    assert.equal(toHex(fromHex('68 34 00 FF')), '68 34 00 FF');
+    assert.equal(toHex(null), '');
+
+    let last = -1;
+    for (const f of FRAME_FIELDS) {
+        assert.ok(f.offset > last, `${f.name} overlaps the previous field`);
+        last = f.offset + f.length - 1;
+    }
+    const byName = Object.fromEntries(FRAME_FIELDS.map(f => [f.name, f]));
+    assert.equal(byName.current_speed.offset, BLE.OFFSET_CURRENT_SPEED);
+    assert.equal(byName.steps.offset, BLE.OFFSET_STEPS);
+    assert.equal(byName.flags.offset, BLE.OFFSET_FLAGS);
+    assert.equal(byName.incline.offset, BLE.OFFSET_INCLINE);
+});
+
+test('decodeExtended does not mistake a 60-byte diagnostics frame for the identity frame', () => {
+    // Real frame from a firmware-37 pad: bytes 32..47 are motor diagnostics
+    // (not ASCII), so the vendor app's "≥52 bytes → serial" rule is wrong here.
+    const view = fromHex(
+        '67 3C 00 0E 74 0E 74 00 00 0D BF 00 00 00 00 00 00 00 01 23 00 42 7F 70 B8 25 ' +
+        '8A 17 70 00 05 02 00 00 00 00 00 00 00 00 1C 07 B0 17 CF 00 00 05 00 00 00 00 ' +
+        '00 00 00 00 00 00 E0 43');
+    const raw = decodeNotification(view);
+    assert.equal(raw.frame_len, 60);
+    assert.equal(raw.firmware, 37);
+    assert.equal(raw.current_speed, 3700);
+    assert.equal(raw.steps, 0, 'this firmware leaves the classic steps field at zero');
+    assert.equal(raw.checksum_ok, true);
+    const ext = decodeExtended(view);
+    assert.equal(ext.kind, 'diagnostics');
+    assert.equal(ext.real_electricity, 0x1C);
+    assert.equal(ext.real_rotate, 0x07B0);
+    assert.equal(ext.real_electricity_steps, 0x17CF);
+    assert.equal(ext.remote_states, 0);
+    assert.equal(ext.buzzer_on, true);
+    assert.equal(ext.device_activate, 1);
+});
+
+test('stepCounterDelta handles u16 wrap and treats a reset as no steps', () => {
+    assert.equal(stepCounterDelta(100, 103), 3);
+    assert.equal(stepCounterDelta(65534, 2), 4);       // wrapped
+    assert.equal(stepCounterDelta(6130, 0), 0);        // power-cycle reset
+    assert.equal(stepCounterDelta(5, 5), 0);
 });
