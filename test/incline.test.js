@@ -142,3 +142,164 @@ test('GradeDetector clears the window on stop (the deck moves while stopped)', (
     // Restart has to settle again.
     assert.equal(feed(det, SETTLE_FRAMES, { running: true, speed: 3700, target: 3700, current: 27 }), 0);
 });
+
+const walking = { running: true, speed: 3700, target: 3700, current: 27 };
+
+function feedValues(det, b, values) {
+    for (const current of values) {
+        det.push({ ...walking, current });
+        det.evaluate(b);
+    }
+}
+
+test('clear readings confirm either grade after 12 seconds at 2 Hz', () => {
+    const b = baselinesFor(measuredCal(), 3.7);
+    for (const [grade, mean] of [[0, 39.6], [INCLINE_GRADE, 27.1]]) {
+        const det = new GradeDetector();
+        feedValues(det, b, Array.from({ length: 23 }, (_, i) => mean + (i % 2 ? 2 : -2)));
+        assert.equal(det.decision, null);
+        feedValues(det, b, [mean + 2]);
+        assert.equal(det.decision, grade);
+        assert.equal(det.confirmed, true);
+    }
+});
+
+test('startup load trend extends settling even after actual speed reaches target', () => {
+    const det = new GradeDetector();
+    feedValues(det, null, Array.from({ length: 24 }, (_, i) => 100 - 2 * i));
+    assert.equal(det.count, 0, 'a ramp must not become training or decision data');
+    feedValues(det, null, Array(16).fill(27));
+    assert.ok(det.count > 0, 'stable load eventually finishes settling');
+});
+
+test('acceleration does not count toward settling', () => {
+    const det = new GradeDetector();
+    feed(det, 30, { ...walking, speed: 3000 });
+    assert.equal(feed(det, SETTLE_FRAMES, walking), 0);
+    assert.equal(det.count, 0);
+    assert.equal(feed(det, 1, walking), 1);
+});
+
+test('noisy readings wait longer than clear ones, then resolve', () => {
+    const cal = emptyCalibration();
+    for (let i = 0; i < 400; i++) {
+        learnSample(cal, 3.7, 0, 39.6 + (i % 2 ? 15 : -15));
+        learnSample(cal, 3.7, INCLINE_GRADE, 27.1 + (i % 2 ? 13 : -13));
+    }
+    const b = baselinesFor(cal, 3.7);
+    for (const [grade, mean, noise] of [[0, 39.6, 15], [INCLINE_GRADE, 27.1, 13]]) {
+        const det = new GradeDetector();
+        const values = n => Array.from({ length: n }, (_, i) => mean + (i % 2 ? noise : -noise));
+        feedValues(det, b, values(24));
+        assert.equal(det.decision, null, 'not enough evidence for early detection');
+        let firstDecisionFrame = null;
+        for (let i = 0; i < 44; i++) {
+            feedValues(det, b, [mean + (i % 2 ? noise : -noise)]);
+            if (det.decision !== null && firstDecisionFrame === null) firstDecisionFrame = 25 + i;
+        }
+        assert.ok(firstDecisionFrame !== null && firstDecisionFrame < 60,
+            'these noisy fixtures resolve before the old 30-second minimum');
+        assert.equal(det.decision, grade, 'additional samples resolve the noise');
+        assert.equal(det.confirmed, true);
+    }
+});
+
+test('correlated blocks do not get treated as independent low-noise readings', () => {
+    const b = baselinesFor(measuredCal(), 3.7);
+    const det = new GradeDetector();
+    feed(det, SETTLE_FRAMES, { ...walking, current: 39.6 });
+    // Mean is above the flat threshold, and all readings are on its flat side.
+    // Per-frame error alone would confirm; block variability must prevent it.
+    feedValues(det, b, [35, 47, 35, 47].flatMap(v => Array(4).fill(v)));
+    assert.equal(classify(b, det.windowMean), 0);
+    assert.equal(det.decision, null);
+    assert.equal(det.confirmed, false);
+});
+
+test('ambiguous readings and an isolated spike never confirm a grade', () => {
+    const b = baselinesFor(measuredCal(), 3.7);
+    const det = new GradeDetector();
+    feedValues(det, b, Array(100).fill(33.35));
+    assert.equal(det.decision, null);
+    feedValues(det, b, [255]);
+    assert.equal(classify(b, det.windowMean), 0, 'spike moves the simple mean beyond the dead band');
+    assert.equal(det.decision, null, 'the uncertainty gate rejects that guess');
+    assert.equal(det.confirmed, false);
+});
+
+test('previous grade is unconfirmed after stop, speed change, invalid data or missing calibration', () => {
+    const b = baselinesFor(measuredCal(), 3.7);
+    for (const interruption of [
+        { ...walking, running: false },
+        { ...walking, speed: 4000, target: 4000 },
+        { ...walking, speed: 3600 },
+        { ...walking, current: NaN },
+        { ...walking, speed: NaN },
+        { ...walking, target: NaN },
+    ]) {
+        const det = new GradeDetector();
+        feedValues(det, b, Array(24).fill(27));
+        assert.equal(det.confirmed, true);
+        det.push(interruption);
+        assert.equal(det.evaluate(b), INCLINE_GRADE);
+        assert.equal(det.confirmed, false);
+        assert.equal(det.count, 0);
+    }
+    const det = new GradeDetector();
+    feedValues(det, b, Array(24).fill(27));
+    assert.equal(det.evaluate(null), INCLINE_GRADE);
+    assert.equal(det.confirmed, false);
+    det.reset();
+    assert.equal(det.decision, null, 'manual override clears the remembered auto decision');
+});
+
+test('a restart can detect the opposite grade without using the old window', () => {
+    const b = baselinesFor(measuredCal(), 3.7);
+    const det = new GradeDetector();
+    feedValues(det, b, Array(24).fill(27));
+    det.push({ ...walking, running: false });
+    feedValues(det, b, Array(23).fill(40));
+    assert.equal(det.decision, INCLINE_GRADE);
+    assert.equal(det.confirmed, false);
+    feedValues(det, b, [40]);
+    assert.equal(det.decision, 0);
+    assert.equal(det.confirmed, true);
+});
+
+test('learned variance survives storage and continues adapting at the weight cap', () => {
+    const cal = emptyCalibration();
+    for (const value of [20, 40, 20, 40]) learnSample(cal, 3.7, 0, value);
+    const flat = cal.buckets['3.5']['0'];
+    assert.equal(flat.mean, 30);
+    assert.ok(Math.abs(flat.variance - 100) < 1e-9);
+    assert.deepEqual(cleanCalibration(JSON.parse(JSON.stringify(cal))), cal);
+    for (let i = 0; i < 2500; i++) learnSample(cal, 3.7, 0, 30);
+    const before = flat.variance;
+    learnSample(cal, 3.7, 0, 60);
+    assert.ok(flat.variance > before);
+    assert.ok(Number.isFinite(flat.variance));
+});
+
+test('legacy or malformed variance gets a conservative default without losing calibration', () => {
+    for (const variance of [undefined, null, -1, Infinity, '0']) {
+        const cal = cleanCalibration({ version: 1, buckets: {
+            '3.5': { '0': { mean: 40, n: 100, variance }, '7': { mean: 27, n: 100, variance } },
+        } });
+        assert.equal(cal.version, 2);
+        assert.equal(cal.buckets['3.5']['0'].mean, 40);
+        assert.equal(cal.buckets['3.5']['0'].n, 100);
+        assert.ok(cal.buckets['3.5']['0'].variance > 0);
+        const det = new GradeDetector();
+        feedValues(det, baselinesFor(cal, 3.7), Array(24).fill(27));
+        assert.equal(det.decision, INCLINE_GRADE);
+    }
+});
+
+test('uncertain calibration can prevent a premature decision even with steady readings', () => {
+    const cal = cleanCalibration({ buckets: {
+        '3.5': { '0': { mean: 36, n: 40 }, '7': { mean: 31, n: 40 } },
+    } });
+    const det = new GradeDetector();
+    feedValues(det, baselinesFor(cal, 3.7), Array(100).fill(31));
+    assert.equal(det.decision, null, 'weak baselines need more manual calibration');
+});
