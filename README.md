@@ -7,7 +7,7 @@ A web-based dashboard to control and monitor a PitPat treadmill via Bluetooth. F
 - Connect, start/stop, pause, and adjust speed over Web Bluetooth
 - Minimal dark instrument UI with an electric lime accent
 - **KPH/MPH toggle** — re-bounds the slider and converts the readout. The treadmill's speed command is always metric internally, so the controller converts your chosen pace to the treadmill's native units before sending it
-- **0% / 7% / Auto incline** — the deck's manual riser isn't reported over Bluetooth, but the motor works measurably less uphill. Set the toggle by hand for a minute or so at each setting and the app learns the motor load for that speed; **Auto** can then detect the grade in about 12 s of steady walking when readings are clear, taking longer when noisy. Calories and climb use the detected grade
+- **0% / 7% / Auto incline** — the deck's manual riser isn't reported over Bluetooth, but the motor works measurably less uphill. **Auto** ships with a built-in reference measured at 3–4.5 kph, estimates nearby speeds from it, and can detect the grade in about 12 s of steady walking when readings are clear, taking longer when noisy or when it has to extrapolate. Setting the toggle by hand teaches it your own motor load, which takes over within about a minute. Calories and climb use the detected grade
 - **Steps from the treadmill's real counter** — some firmware (37, for one) never fills the classic step field; the app reads the motor-side counter instead and only falls back to a height-based estimate when there is nothing to read
 - **Monthly history calendar** — per-day distance and calories, click a day to see and delete individual sessions
 - Import / export session history as JSON (import **merges**, so it never deletes what's already there)
@@ -57,16 +57,23 @@ Import merges into whatever is already stored, matching sessions on their timest
 
 ## Auto incline: how it works and how to calibrate
 
-The pad has no tilt sensor. What it does send, twice a second, is a motor-current byte, and that byte sits lower on the 7% riser because gravity helps move the belt underfoot. Measured at 3.7 kph on one unit: about 40 on the flat versus 27 uphill, with substantial overlap between individual readings.
+The pad has no tilt sensor. What it does send, twice a second, is a motor-current byte, and that byte sits lower on the 7% riser because gravity helps move the belt underfoot. Measured on one unit with one walker:
 
-The level depends on speed and on who is walking, so there is no fixed threshold. Instead:
+| Speed | 0% (flat) | 7% (riser) |
+|---|---|---|
+| 3.0 kph | 40.0 ± 12 | 26.4 ± 11 |
+| 3.7 kph | 39.6 ± 15 | 27.1 ± 13 |
+| 4.5 kph | 39.7 ± 18 | 27.5 ± 15 |
 
-1. Leave the incline toggle on **0%** or **7%**, matching where the deck really is, and walk at your usual speed for at least 30 seconds at each setting. The status line under the toggle shows what is being learned.
-2. Switch the toggle to **Auto**. On the next walk the app waits for at least 4 seconds of stable speed and motor load, then collects at least 8 seconds of readings. Clear readings can confirm the grade in about 12 seconds at the usual two frames per second; noisy or ambiguous readings take longer and may remain unconfirmed. It uses both frame and short-block variability, plus calibration uncertainty, to decide when there is enough evidence. Baselines live in **Settings → Incline calibration**, which also has a reset.
+Individual readings overlap heavily, so the app averages them. The two levels barely move with speed across the walking range, but the noise grows with it.
+
+Those measurements ship in the app as a built-in reference (`DEFAULT_CALIBRATION` in `lib/incline.js`), so **Auto** works from the first walk. Because the unit and the walker still matter, the app also learns:
+
+1. Whenever the incline toggle is on **0%** or **7%**, every settled reading teaches the baseline for that grade at the current speed bucket. The status line under the toggle shows what is being learned. Learned data outweighs the built-in reference after about a minute of walking, so keep the toggle honest: it is the label the calibration learns from.
+2. Lookups pool nearby speed buckets, weighting closer and larger ones more, so a speed you have never walked at is estimated from the ones you have. The further the estimate is carried, the more evidence Auto demands before confirming, and the status line says **estimated from nearby speeds** while it relies on such an estimate. Beyond 1.5 kph from any data the status says **no reference near … kph**.
+3. In **Auto**, the app waits for at least 4 seconds of stable speed and motor load, then collects at least 8 seconds of readings. Clear readings can confirm the grade in about 12 seconds at the usual two frames per second; noisy, ambiguous or extrapolated readings take longer and may remain unconfirmed. It uses both frame and short-block variability, plus calibration uncertainty, to decide when there is enough evidence. Baselines live in **Settings → Incline calibration**, which also has a reset; rows marked **built-in** rest on the shipped reference alone.
 
 The status says **using … · listening…** while retaining the previous incline, and **detected** only when current readings confirm it. A stop or speed change requires fresh evidence. Saved calibration remains compatible; older baselines use a conservative noise estimate until manual walking updates them. These timings are algorithm limits, not verified detection times on the treadmill.
-
-In manual mode the toggle is the label the calibration learns from, so keep it honest. Auto only works at speeds that have both baselines; the status line says when it doesn't.
 
 ## Data tab: capturing the raw stream
 
@@ -101,7 +108,7 @@ Layout:
 | `lib/protocol.js` | BLE UUIDs, notification decoding, command frames |
 | `lib/units.js` | Conversions, slider ranges, ACSM / stride math |
 | `lib/sessions.js` | Session sanitizing, merging, aggregation |
-| `lib/incline.js` | Motor-current grade detector and per-speed calibration |
+| `lib/incline.js` | Motor-current grade detector, built-in reference and per-speed calibration |
 | `lib/dates.js` | The slice of date-fns the calendar needed |
 | `sw.js` | Service worker — offline shell |
 | `tools/` | `analyze-capture.mjs` — offline report on a Data-tab export |

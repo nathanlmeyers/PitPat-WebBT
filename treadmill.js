@@ -32,8 +32,8 @@ import {
 } from './lib/protocol.js';
 
 import {
-    GradeDetector,
-    cleanCalibration, learnSample, baselinesFor, speedBucket,
+    GradeDetector, MIN_BASELINE_SAMPLES,
+    cleanCalibration, learnSample, baselinesFor, withDefaults, speedBucket,
 } from './lib/incline.js';
 
 import {
@@ -155,6 +155,8 @@ let inclineAuto = localStorage.getItem(PREF_INCLINE_AUTO) === '1';
 /** Motor-current baselines per speed bucket, learned while the toggle is
  *  manual. See lib/incline.js. */
 let calibration = loadCalibration();
+/** Built-in reference merged with `calibration`; rebuilt lazily after learning. */
+let activeCal = null;
 let calibrationDirty = false;
 let lastCalibrationSaveAt = 0;
 const detector = new GradeDetector();
@@ -296,6 +298,11 @@ function loadCalibration() {
 }
 
 /** Write baselines through at most every PERSIST_INTERVAL_MS unless forced. */
+/** What Auto classifies against: shipped reference plus everything learned. */
+function activeCalibration() {
+    return activeCal || (activeCal = withDefaults(calibration));
+}
+
 function persistCalibration({ force = false } = {}) {
     if (!calibrationDirty) return;
     const now = Date.now();
@@ -308,6 +315,7 @@ function persistCalibration({ force = false } = {}) {
 
 function resetCalibration() {
     calibration = cleanCalibration(null);
+    activeCal = null;
     calibrationDirty = true;
     persistCalibration({ force: true });
     detector.reset();
@@ -487,11 +495,12 @@ function updateIncline(raw, ext) {
     const kph = rawKph(raw);
     if (settled && !inclineAuto) {
         learnSample(calibration, kph, inclineMode, current);
+        activeCal = null;
         calibrationDirty = true;
         persistCalibration();
     }
     if (inclineAuto) {
-        const decision = detector.evaluate(baselinesFor(calibration, kph));
+        const decision = detector.evaluate(baselinesFor(activeCalibration(), kph));
         if (decision !== null && decision !== inclineMode) applyDetectedIncline(decision);
     }
     renderInclineStatus(kph);
@@ -968,21 +977,26 @@ function renderInclineStatus(kph) {
         if (!running || kph == null) {
             text = `Auto · using ${inclineMode}%`;
         } else {
-            const b = baselinesFor(calibration, kph);
-            if (!b)                                     text = `Auto · not calibrated at ${speedBucket(kph)} kph`;
-            else if (detector.confirmed)                 text = `Auto · ${inclineMode}% detected`;
-            else                                        text = `Auto · using ${inclineMode}% · listening…`;
+            const b = baselinesFor(activeCalibration(), kph);
+            const basis = b && !b.local ? ' · estimated from nearby speeds' : '';
+            if (!b)                                     text = `Auto · no reference near ${speedBucket(kph)} kph`;
+            else if (detector.confirmed)                 text = `Auto · ${inclineMode}% detected${basis}`;
+            else                                        text = `Auto · using ${inclineMode}% · listening…${basis}`;
         }
     } else if (running && kph != null) {
         const b = calibration.buckets[speedBucket(kph)]?.[String(inclineMode)];
-        text = b ? `Learning ${inclineMode}% at ${speedBucket(kph)} kph · ${b.n} samples` : '';
+        text = `Learning ${inclineMode}% at ${speedBucket(kph)} kph · ${b?.n ?? 0} samples`;
     }
     if (inclineStatus.textContent !== text) inclineStatus.textContent = text;
 }
 
+/** Settings list: one row per speed bucket of the active calibration. Rows
+ *  resting on the shipped reference alone say so; green rows have a usable
+ *  learned pair at that speed. */
 function renderCalibrationList() {
     calibrationList.replaceChildren();
-    const keys = Object.keys(calibration.buckets).sort((a, b) => Number(a) - Number(b));
+    const active = activeCalibration();
+    const keys = Object.keys(active.buckets).sort((a, b) => Number(a) - Number(b));
     if (keys.length === 0) {
         const d = document.createElement('div');
         d.className = 'cal-empty';
@@ -991,16 +1005,22 @@ function renderCalibrationList() {
         return;
     }
     for (const key of keys) {
-        const b = calibration.buckets[key];
+        const b = active.buckets[key];
         const row = document.createElement('div');
         const speed = document.createElement('span');
         speed.className = 'cal-speed';
         speed.textContent = `${key} kph`;
         const vals = document.createElement('span');
         vals.className = 'cal-vals';
-        const part = g => b[g] ? `${g}%: ${b[g].mean.toFixed(1)} (${b[g].n})` : `${g}%: —`;
+        const part = g => {
+            if (!b[g]) return `${g}%: —`;
+            const learned = calibration.buckets[key]?.[g];
+            return `${g}%: ${b[g].mean.toFixed(1)} (${learned ? learned.n : 'built-in'})`;
+        };
         vals.textContent = `${part('0')}  ${part(String(INCLINE_GRADE))}`;
-        if (baselinesFor(calibration, Number(key))?.bucket === key) vals.classList.add('cal-ok');
+        const own = calibration.buckets[key];
+        if (own?.['0']?.n >= MIN_BASELINE_SAMPLES && own?.[String(INCLINE_GRADE)]?.n >= MIN_BASELINE_SAMPLES
+            && baselinesFor(active, Number(key))?.local) vals.classList.add('cal-ok');
         row.append(speed, vals);
         calibrationList.appendChild(row);
     }
@@ -1485,8 +1505,11 @@ function renderDecoded() {
     row('effective_grade', `${inclineMode}%`);
     row('window', `${detector.count} frames`);
     row('window_mean', Number.isFinite(detector.windowMean) ? detector.windowMean.toFixed(1) : '—');
-    const b = baselinesFor(calibration, raw.current_speed / 1000);
-    row('baselines', b ? `0%: ${b.flat.mean.toFixed(1)}  ${INCLINE_GRADE}%: ${b.grade.mean.toFixed(1)} @ ${b.bucket} kph` : 'none for this speed');
+    const b = baselinesFor(activeCalibration(), raw.current_speed / 1000);
+    row('baselines', b
+        ? `0%: ${b.flat.mean.toFixed(1)}  ${INCLINE_GRADE}%: ${b.grade.mean.toFixed(1)} @ ${b.bucket} kph`
+            + (b.local ? ' (learned here)' : ` (pooled, ${b.distance.toFixed(2)} kph away)`)
+        : 'none near this speed');
     row('decision', detector.decision === null ? '—' : `${detector.decision}%`);
     row('confirmed', detector.confirmed ? 'yes' : 'no — listening');
     row('step_source', raw.stepSource || '—');
