@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 
 import {
     SETTLE_FRAMES, WINDOW_FRAMES, MIN_DECISION_FRAMES, MIN_BASELINE_SAMPLES,
+    MAX_SPEED_DISTANCE_KPH, DEFAULT_WEIGHT, DEFAULT_CALIBRATION,
     speedBucket, emptyCalibration, cleanCalibration, learnSample, baselinesFor,
-    classify, GradeDetector,
+    withDefaults, classify, GradeDetector,
 } from '../lib/incline.js';
 import { INCLINE_GRADE } from '../lib/units.js';
 
@@ -61,10 +62,68 @@ test('baselinesFor needs both grades, enough samples, and uphill reading lower',
     assert.equal(baselinesFor(bad, 2.0), null);
 });
 
-test('baselinesFor falls back to a neighbouring bucket', () => {
-    const cal = measuredCal();           // learned at 3.5 bucket
-    assert.equal(baselinesFor(cal, 3.9).bucket, '3.5');   // 4.0 missing → 3.5
-    assert.equal(baselinesFor(cal, 4.6), null);           // 4.5 and both neighbours missing
+test('baselinesFor pools nearby buckets and reports when it had to reach', () => {
+    const cal = measuredCal();           // learned at the 3.5 bucket only
+    const here = baselinesFor(cal, 3.7);
+    assert.equal(here.local, true);
+    assert.equal(here.distance, 0, 'inside the bucket is not extrapolation');
+
+    const near = baselinesFor(cal, 3.9);  // 4.0 bucket missing → pooled from 3.5
+    assert.ok(near);
+    assert.equal(near.bucket, '4.0');
+    assert.equal(near.local, false);
+    assert.ok(Math.abs(near.flat.mean - 39.6) < 1e-9 && Math.abs(near.grade.mean - 27.1) < 1e-9);
+    assert.ok(near.distance > 0 && near.distance < 0.5);
+
+    const far = baselinesFor(cal, 4.6);   // 0.85 kph outside the bucket: still an estimate
+    assert.ok(far && !far.local && far.distance > 0.8);
+    assert.equal(baselinesFor(cal, 3.75 + MAX_SPEED_DISTANCE_KPH + 0.01), null, 'out of reach');
+    assert.equal(baselinesFor(cal, 3.25 - MAX_SPEED_DISTANCE_KPH - 0.01), null);
+});
+
+test('pooling weights bigger, closer buckets more and widens variance on disagreement', () => {
+    const cal = emptyCalibration();
+    for (let i = 0; i < 1000; i++) { learnSample(cal, 4.5, 0, 40); learnSample(cal, 4.5, INCLINE_GRADE, 28); }
+    for (let i = 0; i < 50; i++)   { learnSample(cal, 3.5, 0, 44); learnSample(cal, 3.5, INCLINE_GRADE, 24); }
+    const b = baselinesFor(cal, 4.0);     // equidistant: the 4.5 bucket dominates by count
+    assert.ok(b.flat.mean > 40 && b.flat.mean < 40.5, `flat ${b.flat.mean}`);
+    assert.ok(b.grade.mean > 27.5 && b.grade.mean < 28, `grade ${b.grade.mean}`);
+    assert.ok(b.flat.variance > 0, 'constant samples, so all variance comes from the buckets disagreeing');
+    assert.equal(b.local, false);
+});
+
+test('a small mislabelled bucket cannot flip a pooled estimate', () => {
+    const cal = emptyCalibration();
+    for (let i = 0; i < 35; i++) learnSample(cal, 2.5, INCLINE_GRADE, 40.8);  // flat walk labelled 7%
+    const b = baselinesFor(withDefaults(cal), 2.5);
+    assert.ok(b, 'still usable');
+    assert.ok(b.grade.mean < 32, `uphill estimate ${b.grade.mean} still well below flat`);
+    assert.ok(b.separation > 7);
+});
+
+test('withDefaults ships a usable pair across the walking range and yields to learned data', () => {
+    const fresh = withDefaults(emptyCalibration());
+    for (const kph of [2.0, 3.0, 3.7, 4.5, 5.5, 6.0]) {
+        const b = baselinesFor(fresh, kph);
+        assert.ok(b, `no built-in pair at ${kph} kph`);
+        assert.ok(b.separation > 10, `separation ${b.separation} at ${kph} kph`);
+        assert.ok(b.flat.n <= DEFAULT_WEIGHT * 3, 'built-in weight is capped');
+    }
+    assert.equal(baselinesFor(fresh, 3.7).local, true);
+    assert.equal(baselinesFor(fresh, 2.0).local, false);
+    assert.equal(fresh.buckets['4.5']['0'].builtIn, true);
+    assert.equal(Object.keys(DEFAULT_CALIBRATION.buckets).length, 3);
+
+    // A different unit/walker reads 10 units higher: their own minute of
+    // walking must already outweigh the shipped reference.
+    const cal = emptyCalibration();
+    for (let i = 0; i < 150; i++) { learnSample(cal, 3.7, 0, 50); learnSample(cal, 3.7, INCLINE_GRADE, 37); }
+    const mine = withDefaults(cal);
+    assert.equal(mine.buckets['3.5']['0'].builtIn, undefined);
+    assert.ok(mine.buckets['3.5']['0'].mean > 45, `learned data should dominate: ${mine.buckets['3.5']['0'].mean}`);
+    assert.ok(mine.buckets['3.5']['0'].variance > 20, 'the disagreement is kept as uncertainty');
+    assert.deepEqual(cal.buckets['3.5']['0'].n, 150, 'input is not mutated');
+    assert.equal(DEFAULT_CALIBRATION.buckets['3.5']['0'].n, 825, 'defaults are not mutated');
 });
 
 test('classify uses the midpoint with a dead band', () => {
@@ -162,6 +221,24 @@ test('clear readings confirm either grade after 12 seconds at 2 Hz', () => {
         assert.equal(det.decision, grade);
         assert.equal(det.confirmed, true);
     }
+});
+
+test('estimates carried from another speed need clearer readings than local ones', () => {
+    const cal = measuredCal();
+    const local = baselinesFor(cal, 3.7), carried = baselinesFor(cal, 4.9);
+    assert.ok(carried && carried.distance > 1);
+    const run = (b, mean) => {
+        const det = new GradeDetector();
+        feedValues(det, b, Array.from({ length: 60 }, (_, i) => mean + (i % 2 ? 2 : -2)));
+        return det.decision;
+    };
+    // Mildly uphill readings: good enough at the calibrated speed, not when
+    // the baselines were carried over a kilometre per hour.
+    assert.equal(run(local, 30), INCLINE_GRADE);
+    assert.equal(run(carried, 30), null);
+    // Clearly uphill readings still confirm with the carried pair.
+    assert.equal(run(carried, 27.1), INCLINE_GRADE);
+    assert.equal(run(carried, 39.6), 0);
 });
 
 test('startup load trend extends settling even after actual speed reaches target', () => {
