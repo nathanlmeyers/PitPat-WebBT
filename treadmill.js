@@ -32,7 +32,7 @@ import {
 } from './lib/protocol.js';
 
 import {
-    GradeDetector, MIN_DECISION_FRAMES,
+    GradeDetector,
     cleanCalibration, learnSample, baselinesFor, speedBucket,
 } from './lib/incline.js';
 
@@ -390,6 +390,8 @@ function disconnectBluetooth() {
 
 function onDisconnected() {
     connected = false;
+    detector.clearEvidence();
+    renderInclineStatus();
     notifyChar = null;
     writeChar = null;
     connectBtn.textContent = 'Connect';
@@ -943,6 +945,7 @@ function setIncline(value) {
         inclineAuto = false;
         localStorage.setItem(PREF_INCLINE_AUTO, '0');
         if (n === inclineMode && !wasAuto) return;
+        detector.reset();
         inclineMode = n;
         localStorage.setItem(PREF_INCLINE, String(inclineMode));
         if (capture.active) addMarker(`incline → ${inclineMode}%`);
@@ -967,9 +970,8 @@ function renderInclineStatus(kph) {
         } else {
             const b = baselinesFor(calibration, kph);
             if (!b)                                     text = `Auto · not calibrated at ${speedBucket(kph)} kph`;
-            else if (detector.count < MIN_DECISION_FRAMES) text = detector.decision === null
-                                                            ? 'Auto · listening…' : `Auto · ${inclineMode}% (listening…)`;
-            else                                        text = `Auto · ${inclineMode}% detected`;
+            else if (detector.confirmed)                 text = `Auto · ${inclineMode}% detected`;
+            else                                        text = `Auto · using ${inclineMode}% · listening…`;
         }
     } else if (running && kph != null) {
         const b = calibration.buckets[speedBucket(kph)]?.[String(inclineMode)];
@@ -1486,6 +1488,7 @@ function renderDecoded() {
     const b = baselinesFor(calibration, raw.current_speed / 1000);
     row('baselines', b ? `0%: ${b.flat.mean.toFixed(1)}  ${INCLINE_GRADE}%: ${b.grade.mean.toFixed(1)} @ ${b.bucket} kph` : 'none for this speed');
     row('decision', detector.decision === null ? '—' : `${detector.decision}%`);
+    row('confirmed', detector.confirmed ? 'yes' : 'no — listening');
     row('step_source', raw.stepSource || '—');
     decodedTable.replaceChildren(frag);
 }
@@ -1512,7 +1515,7 @@ window.__pitpat = {
         else if (capture.active) recordFrame(value);
     },
     state() {
-        return { inclineMode, inclineAuto, detector: { count: detector.count, mean: detector.windowMean, decision: detector.decision },
+        return { inclineMode, inclineAuto, detector: { count: detector.count, mean: detector.windowMean, decision: detector.decision, confirmed: detector.confirmed },
                  calibration: JSON.parse(JSON.stringify(calibration)), steps: sessionTotals()?.steps ?? null,
                  stepSource: (session || lastFinished)?.stepSource ?? null };
     },
